@@ -12,6 +12,7 @@ const createDirIfNotExists = (dirPath) => {
 
 createDirIfNotExists("/uploads/profile")
 createDirIfNotExists("/uploads/media")
+createDirIfNotExists("/uploads/groups")
 
 // Configure storage for profile pictures
 const profileStorage = multer.diskStorage({
@@ -22,6 +23,19 @@ const profileStorage = multer.diskStorage({
         const userId = req.userId
         const fileExt = path.extname(file.originalname)
         const fileName = `${userId}-${Date.now()}${fileExt}`
+        cb(null, fileName)
+    },
+})
+
+// Configure storage for group images
+const groupStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, path.join(__dirname, "..", "public", "uploads", "groups"))
+    },
+    filename: (req, file, cb) => {
+        const conversationId = req.params.conversationId
+        const fileExt = path.extname(file.originalname)
+        const fileName = `group-${conversationId}-${Date.now()}${fileExt}`
         cb(null, fileName)
     },
 })
@@ -39,7 +53,7 @@ const mediaStorage = multer.diskStorage({
     },
 })
 
-// File filter to allow only images for profile pictures
+// File filter to allow only images for profile pictures and group images
 const imageFileFilter = (req, file, cb) => {
     const allowedFileTypes = /jpeg|jpg|png|gif/
     const extname = allowedFileTypes.test(path.extname(file.originalname).toLowerCase())
@@ -59,6 +73,12 @@ const profileUpload = multer({
     fileFilter: imageFileFilter,
 })
 
+const groupUpload = multer({
+    storage: groupStorage,
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+    fileFilter: imageFileFilter,
+})
+
 const mediaUpload = multer({
     storage: mediaStorage,
     limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
@@ -67,5 +87,6 @@ const mediaUpload = multer({
 // Export the configured multer instances
 module.exports = {
     single: profileUpload.single.bind(profileUpload),
+    group: groupUpload.single.bind(groupUpload),
     media: mediaUpload,
 }
