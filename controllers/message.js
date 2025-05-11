@@ -1,6 +1,8 @@
 const Message = require("../models/message")
 const Conversation = require("../models/conversation")
 const mongoose = require("mongoose")
+const path = require("path")
+const upload = require("../middleware/upload")
 
 // Send message
 exports.sendMessage = async (req, res) => {
@@ -9,10 +11,10 @@ exports.sendMessage = async (req, res) => {
         const { conversationId, content, contentType = "text", replyTo } = req.body
 
         // Validate input
-        if (!conversationId || !content) {
+        if (!conversationId || (!content && !req.file && !req.files)) {
             return res.status(400).json({
                 success: false,
-                message: "Conversation ID and content are required",
+                message: "Conversation ID and either content or media are required",
             })
         }
 
@@ -33,8 +35,8 @@ exports.sendMessage = async (req, res) => {
         const messageData = {
             conversationId,
             sender: userId,
-            content,
-            contentType,
+            content: content || "",
+            contentType: contentType,
         }
 
         // Add reply reference if provided
@@ -45,11 +47,132 @@ exports.sendMessage = async (req, res) => {
             }
         }
 
-        // Add media info if not text
-        if (contentType !== "text" && req.file) {
-            messageData.mediaUrl = `/uploads/media/${req.file.filename}`
+        // Handle multiple files
+        if (req.files && req.files.length > 0) {
+            const messages = [];
+
+            // Process each file and create a message for each
+            for (const file of req.files) {
+                // Determine media type based on mimetype
+                let mediaType = "documents";
+                let fileContentType = "document";
+
+                if (file.mimetype.startsWith('image/')) {
+                    fileContentType = "image";
+                    mediaType = "images";
+                } else if (file.mimetype.startsWith('video/')) {
+                    fileContentType = "video";
+                    mediaType = "videos";
+                } else if (file.mimetype.startsWith('audio/')) {
+                    fileContentType = "audio";
+                    mediaType = "audio";
+                }
+
+                // Get the relative path from the public directory
+                const relativePath = file.path.split('public')[1];
+
+                // Create message data for this file
+                const fileMessageData = {
+                    ...messageData,
+                    contentType: fileContentType,
+                    mediaUrl: relativePath,
+                    mediaSize: file.size,
+                    mediaName: file.originalname,
+                };
+
+                // Set content based on file type if not provided
+                if (!content) {
+                    if (fileContentType === "image") {
+                        fileMessageData.content = "Image";
+                    } else if (fileContentType === "video") {
+                        fileMessageData.content = "Video";
+                    } else if (fileContentType === "audio") {
+                        fileMessageData.content = "Audio Message";
+                    } else {
+                        fileMessageData.content = file.originalname || "Document";
+                    }
+                }
+
+                // Only add reply to the first message
+                if (messages.length > 0) {
+                    delete fileMessageData.replyTo;
+                }
+
+                // Create and save the message
+                const newMessage = new Message(fileMessageData);
+                await newMessage.save();
+
+                // Populate sender info
+                await newMessage.populate("sender", "_id name phoneNumber profilePicture");
+
+                // Populate reply info if exists
+                if (newMessage.replyTo) {
+                    await newMessage.populate({
+                        path: "replyTo",
+                        select: "content contentType sender",
+                        populate: {
+                            path: "sender",
+                            select: "_id name",
+                        },
+                    });
+                }
+
+                messages.push(newMessage);
+            }
+
+            // Update conversation with last message
+            conversation.lastMessage = messages[messages.length - 1]._id;
+
+            // Update unread counts for all participants except sender
+            conversation.unreadCounts.forEach((uc) => {
+                if (uc.user.toString() !== userId) {
+                    uc.count += messages.length;
+                }
+            });
+
+            await conversation.save();
+
+            return res.status(201).json({
+                success: true,
+                messages: messages,
+            });
+        }
+
+        // Handle single file
+        if (req.file) {
+            // Determine media type based on mimetype
+            let mediaType = "documents"
+            if (req.file.mimetype.startsWith('image/')) {
+                messageData.contentType = "image"
+                mediaType = "images"
+            } else if (req.file.mimetype.startsWith('video/')) {
+                messageData.contentType = "video"
+                mediaType = "videos"
+            } else if (req.file.mimetype.startsWith('audio/')) {
+                messageData.contentType = "audio"
+                mediaType = "audio"
+            } else {
+                messageData.contentType = "document"
+            }
+
+            // Get the relative path from the public directory
+            const relativePath = req.file.path.split('public')[1]
+            messageData.mediaUrl = relativePath
             messageData.mediaSize = req.file.size
             messageData.mediaName = req.file.originalname
+
+            // Set default content if not provided
+            if (!content) {
+                if (messageData.contentType === "image") {
+                    messageData.content = "Image"
+                } else if (messageData.contentType === "video") {
+                    messageData.content = "Video"
+                } else if (messageData.contentType === "audio") {
+                    messageData.content = "Audio Message"
+                } else {
+                    messageData.content = req.file.originalname || "Document"
+                }
+            }
         }
 
         // Create new message
@@ -92,6 +215,7 @@ exports.sendMessage = async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Server error while sending message",
+            error: error.message
         })
     }
 }

@@ -38,6 +38,7 @@ const groupCallRoutes = require("./routes/group-call")
 const callLogRoutes = require("./routes/call-log")
 const callQualityRoutes = require("./routes/ice-quality")
 const iceServerRoutes = require("./routes/ice-server")
+const contactRoutes = require("./routes/contact")
 const {Server} = require("socket.io");
 app.use("/api/auth", authRoutes)
 app.use("/api/profile", profileRoutes)
@@ -49,6 +50,7 @@ app.use("/api/group-calls", groupCallRoutes)
 app.use("/api/call-logs", callLogRoutes)
 app.use("/api/call-quality", callQualityRoutes)
 app.use("/api/ice-servers", iceServerRoutes)
+app.use("/api/contacts", contactRoutes)
 
 
 const PORT = process.env.PORT || 4000;

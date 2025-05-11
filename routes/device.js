@@ -8,7 +8,6 @@ const router = express.Router()
 router.get("/", authenticate, deviceController.getDevices)
 router.put("/active/:deviceId", authenticate, deviceController.setActiveDevice)
 router.delete("/:deviceId", authenticate, deviceController.removeDevice)
-router.put("/:deviceId/name", authenticate, deviceController.updateDeviceName)
-router.put("/:deviceId/activity", authenticate, deviceController.updateDeviceActivity)
+router.post("/logout-all", authenticate, deviceController.logoutAllOtherDevices)
 
 module.exports = router

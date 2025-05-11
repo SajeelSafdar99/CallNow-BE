@@ -40,15 +40,34 @@ const groupStorage = multer.diskStorage({
     },
 })
 
-// Configure storage for media files (images, videos, etc.)
+// Configure storage for media files (images, videos, etc.) with user-specific folders
 const mediaStorage = multer.diskStorage({
     destination: (req, file, cb) => {
-        cb(null, path.join(__dirname, "..", "public", "uploads", "media"))
+        // Create user-specific directory
+        const userId = req.userId
+        let mediaType = "documents"
+
+        // Determine media type based on mimetype
+        if (file.mimetype.startsWith('image/')) {
+            mediaType = "images"
+        } else if (file.mimetype.startsWith('video/')) {
+            mediaType = "videos"
+        } else if (file.mimetype.startsWith('audio/')) {
+            mediaType = "audio"
+        }
+
+        const userMediaPath = path.join(__dirname, "..", "public", "uploads", "media", userId, mediaType)
+
+        // Create directory if it doesn't exist
+        if (!fs.existsSync(userMediaPath)) {
+            fs.mkdirSync(userMediaPath, { recursive: true })
+        }
+
+        cb(null, userMediaPath)
     },
     filename: (req, file, cb) => {
-        const userId = req.userId
         const fileExt = path.extname(file.originalname)
-        const fileName = `${userId}-${Date.now()}${fileExt}`
+        const fileName = `${Date.now()}${fileExt}`
         cb(null, fileName)
     },
 })
@@ -89,4 +108,7 @@ module.exports = {
     single: profileUpload.single.bind(profileUpload),
     group: groupUpload.single.bind(groupUpload),
     media: mediaUpload,
+    getMediaPath: (userId, mediaType, fileName) => {
+        return `/uploads/media/${userId}/${mediaType}/${fileName}`;
+    }
 }

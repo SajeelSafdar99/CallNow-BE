@@ -5,7 +5,7 @@ exports.getDevices = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware
 
-        const user = await User.findById(userId).select("devices activeDevice")
+        const user = await User.findById(userId)
         if (!user) {
             return res.status(404).json({
                 success: false,
@@ -13,10 +13,35 @@ exports.getDevices = async (req, res) => {
             })
         }
 
+        // Debug: Log the activeDevice value
+        console.log("Active device in DB:", user.activeDevice);
+        console.log("Devices before update:", JSON.stringify(user.devices));
+
+        // Make sure device active status is consistent with activeDevice field
+        if (user.activeDevice) {
+            user.devices = user.devices.map(device => ({
+                ...device.toObject ? device.toObject() : device, // Convert to plain object if it's a Mongoose document
+                isActive: device.deviceId === user.activeDevice
+            }))
+
+            // Debug: Log the updated devices
+            console.log("Devices after update:", JSON.stringify(user.devices));
+
+            // Save the updated devices array if there were any inconsistencies
+            const needsUpdate = user.devices.some(device =>
+                (device.deviceId === user.activeDevice && !device.isActive) ||
+                (device.deviceId !== user.activeDevice && device.isActive)
+            )
+
+            if (needsUpdate) {
+                await user.save()
+            }
+        }
+
         res.status(200).json({
             success: true,
             devices: user.devices,
-            activeDevice: user.activeDevice,
+            activeDevice: user.activeDevice // Make sure to include this in the response
         })
     } catch (error) {
         console.error("Get devices error:", error)
@@ -26,7 +51,6 @@ exports.getDevices = async (req, res) => {
         })
     }
 }
-
 // Set active device
 exports.setActiveDevice = async (req, res) => {
     try {
@@ -50,8 +74,21 @@ exports.setActiveDevice = async (req, res) => {
             })
         }
 
-        // Update active device
+        // Update active device status for all devices
+        user.devices = user.devices.map(device => ({
+            ...device,
+            isActive: device.deviceId === deviceId
+        }))
+
+        // Update active device field
         user.activeDevice = deviceId
+
+        // Update last active timestamp for the device
+        const deviceIndex = user.devices.findIndex(device => device.deviceId === deviceId)
+        if (deviceIndex !== -1) {
+            user.devices[deviceIndex].lastActive = new Date()
+        }
+
         await user.save()
 
         res.status(200).json({
@@ -67,14 +104,13 @@ exports.setActiveDevice = async (req, res) => {
         })
     }
 }
-
 // Remove device
 exports.removeDevice = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware
         const { deviceId } = req.params
 
-        // Find user
+        // Check if device exists for this user
         const user = await User.findById(userId)
         if (!user) {
             return res.status(404).json({
@@ -83,7 +119,6 @@ exports.removeDevice = async (req, res) => {
             })
         }
 
-        // Check if device exists
         const deviceExists = user.devices.some((device) => device.deviceId === deviceId)
         if (!deviceExists) {
             return res.status(404).json({
@@ -92,12 +127,15 @@ exports.removeDevice = async (req, res) => {
             })
         }
 
-        // Remove device from devices array
+        // Remove the device
         user.devices = user.devices.filter((device) => device.deviceId !== deviceId)
 
-        // If removed device was the active device, set active device to null or another device
-        if (user.activeDevice === deviceId) {
-            user.activeDevice = user.devices.length > 0 ? user.devices[0].deviceId : null
+        // If the removed device was the active device, set a new active device if available
+        if (user.activeDevice === deviceId && user.devices.length > 0) {
+            user.activeDevice = user.devices[0].deviceId
+            user.devices[0].isActive = true
+        } else if (user.devices.length === 0) {
+            user.activeDevice = ""
         }
 
         await user.save()
@@ -105,8 +143,6 @@ exports.removeDevice = async (req, res) => {
         res.status(200).json({
             success: true,
             message: "Device removed successfully",
-            devices: user.devices,
-            activeDevice: user.activeDevice,
         })
     } catch (error) {
         console.error("Remove device error:", error)
@@ -116,22 +152,18 @@ exports.removeDevice = async (req, res) => {
         })
     }
 }
-
-// Update device name
-exports.updateDeviceName = async (req, res) => {
+exports.logoutAllOtherDevices = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware
-        const { deviceId } = req.params
-        const { deviceName } = req.body
+        const { currentDeviceId } = req.params
 
-        if (!deviceName) {
+        if (!currentDeviceId) {
             return res.status(400).json({
                 success: false,
-                message: "Device name is required",
+                message: "Current device ID is required",
             })
         }
 
-        // Find user
         const user = await User.findById(userId)
         if (!user) {
             return res.status(404).json({
@@ -140,71 +172,34 @@ exports.updateDeviceName = async (req, res) => {
             })
         }
 
-        // Find and update device
-        const deviceIndex = user.devices.findIndex((device) => device.deviceId === deviceId)
-        if (deviceIndex === -1) {
+        // Check if current device exists
+        const currentDevice = user.devices.find((device) => device.deviceId === currentDeviceId)
+        if (!currentDevice) {
             return res.status(404).json({
                 success: false,
-                message: "Device not found for this user",
+                message: "Current device not found",
             })
         }
 
-        // Update device name
-        user.devices[deviceIndex].deviceName = deviceName
-        user.devices[deviceIndex].lastActive = new Date()
+        // Keep only the current device
+        user.devices = user.devices.filter((device) => device.deviceId === currentDeviceId)
+
+        // Set the current device as active
+        user.activeDevice = currentDeviceId
+        user.devices[0].isActive = true
+        user.devices[0].lastActive = new Date()
+
         await user.save()
 
         res.status(200).json({
             success: true,
-            message: "Device name updated successfully",
-            device: user.devices[deviceIndex],
+            message: "Logged out from all other devices successfully",
         })
     } catch (error) {
-        console.error("Update device name error:", error)
+        console.error("Logout all other devices error:", error)
         res.status(500).json({
             success: false,
-            message: "Server error while updating device name",
-        })
-    }
-}
-
-// Update last active timestamp for device
-exports.updateDeviceActivity = async (req, res) => {
-    try {
-        const userId = req.userId // From auth middleware
-        const { deviceId } = req.params
-
-        // Find user
-        const user = await User.findById(userId)
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: "User not found",
-            })
-        }
-
-        // Find device
-        const deviceIndex = user.devices.findIndex((device) => device.deviceId === deviceId)
-        if (deviceIndex === -1) {
-            return res.status(404).json({
-                success: false,
-                message: "Device not found for this user",
-            })
-        }
-
-        // Update last active timestamp
-        user.devices[deviceIndex].lastActive = new Date()
-        await user.save()
-
-        res.status(200).json({
-            success: true,
-            message: "Device activity updated successfully",
-        })
-    } catch (error) {
-        console.error("Update device activity error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while updating device activity",
+            message: "Server error while logging out from other devices",
         })
     }
 }

@@ -231,6 +231,7 @@ exports.login = async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: "Account not verified. Please verify your phone number first.",
+                status: "unverified",
             })
         }
 
