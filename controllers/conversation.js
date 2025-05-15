@@ -9,7 +9,7 @@ exports.getOrCreateConversation = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware
         const { recipientId } = req.body
-
+        console.log(userId, recipientId)
         // Validate input
         if (!recipientId) {
             return res.status(400).json({
@@ -500,7 +500,7 @@ exports.leaveGroup = async (req, res) => {
         }
 
         // Check if user is in the group
-        if (!conversation.participants.includes(mongoose.Types.ObjectId(userId))) {
+        if (!conversation.participants.includes(new mongoose.Types.ObjectId(userId))) {
             return res.status(400).json({
                 success: false,
                 message: "You are not in this group",

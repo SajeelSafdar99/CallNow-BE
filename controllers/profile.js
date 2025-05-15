@@ -74,7 +74,38 @@ exports.updateProfilePicture = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware
 
-        // Check if file was uploaded
+        // Handle removal request
+        if (req.body.removeProfilePicture === "true") {
+            const user = await User.findById(userId)
+            if (!user) {
+                return res.status(404).json({
+                    success: false,
+                    message: "User not found",
+                })
+            }
+
+            // Delete existing profile picture if exists
+            if (user.profilePicture) {
+                const oldPath = path.join(__dirname, "..", "public", user.profilePicture)
+                if (fs.existsSync(oldPath)) {
+                    fs.unlinkSync(oldPath)
+                }
+            }
+
+            user.profilePicture = null
+            await user.save()
+
+            return res.status(200).json({
+                success: true,
+                message: "Profile picture removed successfully",
+                user: {
+                    ...user.toObject(),
+                    password: undefined,
+                },
+            })
+        }
+
+        // Normal update logic when a new file is uploaded
         if (!req.file) {
             return res.status(400).json({
                 success: false,
@@ -82,35 +113,39 @@ exports.updateProfilePicture = async (req, res) => {
             })
         }
 
-        // Get the file path
         const profilePicturePath = `/uploads/profile/${req.file.filename}`
 
-        // Find user and update profile picture
-        const updatedUser = await User.findByIdAndUpdate(
-            userId,
-            { $set: { profilePicture: profilePicturePath } },
-            { new: true },
-        ).select("-password")
-
-        if (!updatedUser) {
-            // Delete the uploaded file if user not found
+        const user = await User.findById(userId)
+        if (!user) {
             fs.unlinkSync(path.join(__dirname, "..", "public", profilePicturePath))
-
             return res.status(404).json({
                 success: false,
                 message: "User not found",
             })
         }
 
+        // Delete old profile picture if exists
+        if (user.profilePicture) {
+            const oldPath = path.join(__dirname, "..", "public", user.profilePicture)
+            if (fs.existsSync(oldPath)) {
+                fs.unlinkSync(oldPath)
+            }
+        }
+
+        user.profilePicture = profilePicturePath
+        await user.save()
+
         res.status(200).json({
             success: true,
             message: "Profile picture updated successfully",
-            user: updatedUser,
+            user: {
+                ...user.toObject(),
+                password: undefined,
+            },
         })
     } catch (error) {
         console.error("Update profile picture error:", error)
 
-        // Delete the uploaded file if there was an error
         if (req.file) {
             const filePath = path.join(__dirname, "..", "public", `/uploads/profile/${req.file.filename}`)
             if (fs.existsSync(filePath)) {

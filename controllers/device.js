@@ -1,4 +1,5 @@
 const User = require("../models/user")
+const PaymentService = require("../services/payment")
 
 // Get all devices for the current user
 exports.getDevices = async (req, res) => {
@@ -38,10 +39,15 @@ exports.getDevices = async (req, res) => {
             }
         }
 
+        // Check subscription status
+        const subscriptionResult = await PaymentService.checkSubscription(userId)
+        const hasActiveSubscription = subscriptionResult.success && subscriptionResult.hasActiveSubscription
+
         res.status(200).json({
             success: true,
             devices: user.devices,
-            activeDevice: user.activeDevice // Make sure to include this in the response
+            activeDevice: user.activeDevice,
+            hasActiveSubscription
         })
     } catch (error) {
         console.error("Get devices error:", error)
@@ -51,6 +57,7 @@ exports.getDevices = async (req, res) => {
         })
     }
 }
+
 // Set active device
 exports.setActiveDevice = async (req, res) => {
     try {
@@ -72,6 +79,37 @@ exports.setActiveDevice = async (req, res) => {
                 success: false,
                 message: "Device not found for this user",
             })
+        }
+
+        // Check if user already has an active device and needs subscription
+        if (user.activeDevice && user.activeDevice !== deviceId) {
+            // Check subscription status
+            const subscriptionResult = await PaymentService.checkSubscription(userId)
+
+            if (!subscriptionResult.success) {
+                return res.status(500).json({
+                    success: false,
+                    message: "Error checking subscription status",
+                })
+            }
+
+            // If user doesn't have an active subscription, they can't change active device
+            if (!subscriptionResult.hasActiveSubscription) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Subscription required to change active device",
+                    requiresSubscription: true,
+                })
+            }
+
+            // If user has a subscription but it's not premium, they can't change active device
+            if (subscriptionResult.subscription && subscriptionResult.subscription.plan !== "premium") {
+                return res.status(403).json({
+                    success: false,
+                    message: "Premium subscription required to change active device",
+                    requiresUpgrade: true,
+                })
+            }
         }
 
         // Update active device status for all devices
@@ -104,7 +142,8 @@ exports.setActiveDevice = async (req, res) => {
         })
     }
 }
-// Remove device
+
+// Other device controller methods remain the same...
 exports.removeDevice = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware
@@ -152,6 +191,7 @@ exports.removeDevice = async (req, res) => {
         })
     }
 }
+
 exports.logoutAllOtherDevices = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware

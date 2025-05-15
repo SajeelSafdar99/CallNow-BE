@@ -38,8 +38,16 @@ const userSchema = new mongoose.Schema(
                 deviceId: String,
                 deviceName: String,
                 lastActive: Date,
+                isActive: {
+                    type: Boolean,
+                    default: false
+                }
             },
         ],
+        subscriptionId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Subscription",
+        },
         createdAt: {
             type: Date,
             default: Date.now,
