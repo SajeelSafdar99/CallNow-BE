@@ -1,34 +1,35 @@
-require('dotenv').config();
-const express = require('express');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const connectDB = require('./config/db');
-const app = express();
+require("dotenv").config()
+const express = require("express")
+const mongoose = require("mongoose")
+const cors = require("cors")
+const helmet = require("helmet")
+const morgan = require("morgan")
+const connectDB = require("./config/db")
+const app = express()
 const { verifyToken } = require("./utils/jwt")
 const path = require("path")
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
 app.use(
     cors({
-        origin: "http://127.0.0.1:5173",
-        methods: "GET, POST, PUT, DELETE, OPTIONS",
+        origin: ["http://127.0.0.1:5173", "http://192.168.10.53:5173"], // Allow both localhost and 127.0.0.1
+        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: "*",
-    })
-);
+        credentials: true, // Allow credentials
+    }),
+)
 
 app.use(
     helmet({
         crossOriginResourcePolicy: false,
-    })
-);
-app.use(morgan('dev'));
+    }),
+)
+app.use(morgan("dev"))
 
-connectDB();
+connectDB()
 app.use(express.static(path.join(__dirname, "public")))
 
-const authRoutes = require('./routes/auth')
+const authRoutes = require("./routes/auth")
 const profileRoutes = require("./routes/profile")
 const deviceRoutes = require("./routes/device")
 const conversationRoutes = require("./routes/conversation")
@@ -40,7 +41,7 @@ const callQualityRoutes = require("./routes/ice-quality")
 const iceServerRoutes = require("./routes/ice-server")
 const contactRoutes = require("./routes/contact")
 const subscriptionRoutes = require("./routes/subscription")
-const {Server} = require("socket.io");
+
 app.use("/api/auth", authRoutes)
 app.use("/api/profile", profileRoutes)
 app.use("/api/devices", deviceRoutes)
@@ -54,11 +55,22 @@ app.use("/api/ice-servers", iceServerRoutes)
 app.use("/api/contacts", contactRoutes)
 app.use("/api/subscriptions", subscriptionRoutes)
 
+const PORT = process.env.PORT || 4000
+const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`))
 
-const PORT = process.env.PORT || 4000;
-const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-const socket = require("socket.io")
-const io = socket(server)// Socket.io middleware for authentication
+// Initialize Socket.io with proper CORS configuration
+const { Server } = require("socket.io")
+const io = new Server(server, {
+    cors: {
+        origin: ["http://127.0.0.1:5173", "http://192.168.10.53:5173"],
+        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+        credentials: true,
+    },
+    path: "/socket.io/", // Explicit path
+})
+
+// Socket.io middleware for authentication
 io.use((socket, next) => {
     const token = socket.handshake.auth.token
     if (!token) {
@@ -74,6 +86,19 @@ io.use((socket, next) => {
     socket.deviceId = socket.handshake.auth.deviceId
     next()
 })
+let users = []
+
+const addUser = (userId, socketId) => {
+    !users.some((user) => user.userId === userId) && users.push({ userId, socketId })
+}
+
+const removeUser = (socketId) => {
+    users = users.filter((user) => user.socketId !== socketId)
+}
+
+const getUser = (userId) => {
+    return users.find((user) => user.userId === userId)
+}
 
 // Socket.io connection
 io.on("connection", (socket) => {
@@ -93,17 +118,20 @@ io.on("connection", (socket) => {
         socket.leave(conversationId)
         console.log(`User ${socket.userId} left conversation: ${conversationId}`)
     })
+    socket.on("addUser", (userId) => {
+        addUser(userId, socket.id)
+        io.emit("getUsers", users)
+    })
 
-    // Handle new message
-    socket.on("send-message", (message) => {
-        // Broadcast to all users in the conversation except sender
-        socket.to(message.conversationId).emit("receive-message", message)
-
-        // Send delivery status to sender's other devices
-        socket.to(socket.userId).emit("message-sent", {
-            messageId: message._id,
-            conversationId: message.conversationId,
-        })
+    //send and get message
+    socket.on("sendMessage", ({ senderId, receiverId, text }) => {
+        const user = getUser(receiverId)
+        if (user) {
+            io.to(user.socketId).emit("getMessage", {
+                senderId,
+                text,
+            })
+        }
     })
 
     // Handle message read
@@ -126,18 +154,13 @@ io.on("connection", (socket) => {
 
     // Handle typing indicator
     socket.on("typing", ({ conversationId, userId }) => {
-        socket.to(conversationId).emit("user-typing", {
-            conversationId,
-            userId,
-        })
+        console.log(`Server received typing event from user ${userId} in conversation ${conversationId}`)
+        socket.to(conversationId).emit("user-typing", { conversationId, userId })
     })
 
-    // Handle stop typing indicator
     socket.on("stop-typing", ({ conversationId, userId }) => {
-        socket.to(conversationId).emit("user-stop-typing", {
-            conversationId,
-            userId,
-        })
+        console.log(`Server received stop-typing event from user ${userId} in conversation ${conversationId}`)
+        socket.to(conversationId).emit("user-stop-typing", { conversationId, userId })
     })
 
     // Handle user online status
@@ -146,6 +169,63 @@ io.on("connection", (socket) => {
         socket.broadcast.emit("user-status-change", {
             userId: socket.userId,
             status,
+        })
+    })
+
+    // Add these event handlers after the "set-online-status" handler
+
+    // Handle user status query
+    socket.on("get-user-status", ({ userId }) => {
+        // Find the socket of the requested user if they're online
+        const userSockets = io.sockets.adapter.rooms.get(userId)
+        const isOnline = !!userSockets && userSockets.size > 0
+
+        // Send status back to requester
+        socket.emit("user-status", {
+            userId,
+            status: isOnline ? "online" : "offline",
+        })
+    })
+
+    // Handle joining group rooms (for group details updates)
+    socket.on("join-group-room", (groupId) => {
+        socket.join(`group:${groupId}`)
+        console.log(`User ${socket.userId} joined group room: group:${groupId}`)
+    })
+
+    // Handle leaving group rooms
+    socket.on("leave-group-room", (groupId) => {
+        socket.leave(`group:${groupId}`)
+        console.log(`User ${socket.userId} left group room: group:${groupId}`)
+    })
+
+    // Handle group updates
+    socket.on("update-group", ({ groupId, updates }) => {
+        socket.to(`group:${groupId}`).emit("group-updated", {
+            _id: groupId,
+            ...updates,
+        })
+    })
+
+    // Handle participant management
+    socket.on("add-participant", ({ groupId, participant }) => {
+        socket.to(`group:${groupId}`).emit("participant-added", {
+            groupId,
+            participant,
+        })
+    })
+
+    socket.on("remove-participant", ({ groupId, participantId }) => {
+        socket.to(`group:${groupId}`).emit("participant-removed", {
+            groupId,
+            participantId,
+        })
+    })
+
+    socket.on("change-admin", ({ groupId, newAdminId }) => {
+        socket.to(`group:${groupId}`).emit("admin-changed", {
+            groupId,
+            newAdminId,
         })
     })
 
@@ -347,4 +427,3 @@ mongoose
     .connect(process.env.MONGODB_URI)
     .then(() => console.log("Connected to MongoDB"))
     .catch((err) => console.error("MongoDB connection error:", err))
-

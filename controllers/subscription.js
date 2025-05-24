@@ -21,6 +21,7 @@ exports.getSubscription = async (req, res) => {
             hasActiveSubscription: result.hasActiveSubscription,
             subscription: result.hasActiveSubscription ? result.subscription : null,
         })
+        console.log("Subscription:", result.subscription);
     } catch (error) {
         console.error("Get subscription error:", error)
         res.status(500).json({
