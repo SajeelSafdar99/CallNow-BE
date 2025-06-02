@@ -3,55 +3,62 @@ const IceServer = require("../models/ice-server")
 // Get active ICE servers
 exports.getIceServers = async (req, res) => {
     try {
-        const { region } = req.query
+        const {region} = req.query;
 
-        // Build query
-        const query = { isActive: true }
+        // Base filter
+        const query = {isActive: true};
 
-        // Add region filter if provided
+        // If the client asks for a specific region (not “global”), include both that region and the global pool
         if (region && region !== "global") {
-            query.$or = [{ region }, { region: "global" }]
+            query.$or = [{region}, {region: "global"}];
         }
 
-        // Get ICE servers
-        const iceServers = await IceServer.find(query)
-            .sort({ priority: -1 }) // Sort by priority (highest first)
-            .select("-__v")
+        // Fetch only the fields we need
+        const iceServers = await IceServer
+            .find(query)
+            .sort({priority: -1})
+            .select([
+                "_id",
+                "urls",
+                "username",
+                "credential",
+                "priority",
+                "region",
+                "serverType",
+                "isActive"
+            ].join(" "))   // equivalent to .select("urls username credential priority region serverType isActive")
+            .lean();        // lean() gives you plain JS objects, slightly faster
 
-        // Format for WebRTC
-        const formattedServers = iceServers.map((server) => {
-            const formattedServer = {
-                urls: server.urls,
-            }
+        // Map to the structure you want
+        const formattedServers = iceServers.map(s => {
+            const out = {urls: s.urls};
+            if (s._id) out._id = s._id;
+            if (s.username) out.username = s.username;
+            if (s.credential) out.credential = s.credential;
+            if (s.priority) out.priority = s.priority;
+            if (s.region) out.region = s.region;
+            if (s.serverType) out.serverType = s.serverType;
 
-            if (server.username) {
-                formattedServer.username = server.username
-            }
+            return out;
+        });
 
-            if (server.credential) {
-                formattedServer.credential = server.credential
-            }
+        console.log(formattedServers);
+        res.status(200).json({success: true, iceServers: formattedServers});
 
-            return formattedServer
-        })
-
-        res.status(200).json({
-            success: true,
-            iceServers: formattedServers,
-        })
     } catch (error) {
-        console.error("Get ICE servers error:", error)
+        console.error("Get ICE servers error:", error);
         res.status(500).json({
             success: false,
-            message: "Server error while fetching ICE servers",
-        })
+            message: "Server error while fetching ICE servers"
+        });
     }
-}
+};
+
 
 // Admin: Add ICE server
 exports.addIceServer = async (req, res) => {
     try {
-        const { urls, username, credential, priority, serverType, region, provider, expiresAt } = req.body
+        const {urls, username, credential, priority, serverType, region, provider, expiresAt} = req.body
 
         // Validate input
         if (!urls || !Array.isArray(urls) || urls.length === 0 || !serverType) {
@@ -91,8 +98,8 @@ exports.addIceServer = async (req, res) => {
 // Admin: Update ICE server
 exports.updateIceServer = async (req, res) => {
     try {
-        const { id } = req.params
-        const { urls, username, credential, priority, isActive, region, provider, expiresAt } = req.body
+        const {id} = req.params
+        const {urls, username, credential, priority, isActive, region, provider, expiresAt} = req.body
 
         // Find ICE server
         const iceServer = await IceServer.findById(id)
@@ -131,9 +138,7 @@ exports.updateIceServer = async (req, res) => {
 // Admin: Delete ICE server
 exports.deleteIceServer = async (req, res) => {
     try {
-        const { id } = req.params
-
-        // Find and delete ICE server
+        const {id} = req.params
         const result = await IceServer.findByIdAndDelete(id)
         if (!result) {
             return res.status(404).json({

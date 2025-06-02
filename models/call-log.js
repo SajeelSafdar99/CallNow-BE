@@ -14,21 +14,6 @@ const callLogSchema = new mongoose.Schema(
         },
         eventType: {
             type: String,
-            enum: [
-                "initiated",
-                "ringing",
-                "answered",
-                "rejected",
-                "missed",
-                "ended",
-                "participant_joined",
-                "participant_left",
-                "screen_share_started",
-                "screen_share_ended",
-                "quality_issue",
-                "network_change",
-                "fallback_activated",
-            ],
             required: true,
         },
         user: {

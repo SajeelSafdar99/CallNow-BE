@@ -29,6 +29,23 @@ const userSchema = new mongoose.Schema(
             type: Boolean,
             default: false,
         },
+        isAdmin: {
+            type: Boolean,
+            default: false,
+        },
+        isSuspended: {
+            type: Boolean,
+            default: false,
+        },
+        suspensionDetails: {
+            suspendedAt: Date,
+            suspendedBy: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "User",
+            },
+            reason: String,
+            expiresAt: Date, // Optional: for temporary suspensions
+        },
         activeDevice: {
             type: String,
             default: "",
@@ -38,10 +55,11 @@ const userSchema = new mongoose.Schema(
                 deviceId: String,
                 deviceName: String,
                 lastActive: Date,
+                fcmToken: String,
                 isActive: {
                     type: Boolean,
-                    default: false
-                }
+                    default: false,
+                },
             },
         ],
         subscriptionId: {
@@ -72,6 +90,14 @@ userSchema.pre("save", async function (next) {
 // Method to compare password
 userSchema.methods.comparePassword = async function (candidatePassword) {
     return await bcrypt.compare(candidatePassword, this.password)
+}
+
+// Method to check if suspension has expired
+userSchema.methods.isSuspensionExpired = function () {
+    if (!this.isSuspended || !this.suspensionDetails?.expiresAt) {
+        return false
+    }
+    return new Date() > new Date(this.suspensionDetails.expiresAt)
 }
 
 const User = mongoose.model("User", userSchema)

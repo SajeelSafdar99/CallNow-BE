@@ -53,7 +53,6 @@ const groupCallSchema = new mongoose.Schema(
         },
         status: {
             type: String,
-            enum: ["active", "ended"],
             default: "active",
         },
         type: {

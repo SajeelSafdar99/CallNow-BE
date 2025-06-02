@@ -22,7 +22,7 @@ const iceServerSchema = new mongoose.Schema(
         },
         serverType: {
             type: String,
-            enum: ["stun", "turn"],
+            enum: ["stun", "turn", "Stun","Turn"],
             required: true,
         },
         region: {

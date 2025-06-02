@@ -1,5 +1,3 @@
-const User = require("../models/user")
-const Subscription = require("../models/subscription")
 const PaymentService = require("../services/payment")
 
 // Get subscription details

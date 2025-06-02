@@ -15,23 +15,24 @@ exports.getDevices = async (req, res) => {
         }
 
         // Debug: Log the activeDevice value
-        console.log("Active device in DB:", user.activeDevice);
-        console.log("Devices before update:", JSON.stringify(user.devices));
+        console.log("Active device in DB:", user.activeDevice)
+        console.log("Devices before update:", JSON.stringify(user.devices))
 
         // Make sure device active status is consistent with activeDevice field
         if (user.activeDevice) {
-            user.devices = user.devices.map(device => ({
-                ...device.toObject ? device.toObject() : device, // Convert to plain object if it's a Mongoose document
-                isActive: device.deviceId === user.activeDevice
+            user.devices = user.devices.map((device) => ({
+                ...(device.toObject ? device.toObject() : device), // Convert to plain object if it's a Mongoose document
+                isActive: device.deviceId === user.activeDevice,
             }))
 
             // Debug: Log the updated devices
-            console.log("Devices after update:", JSON.stringify(user.devices));
+            console.log("Devices after update:", JSON.stringify(user.devices))
 
             // Save the updated devices array if there were any inconsistencies
-            const needsUpdate = user.devices.some(device =>
-                (device.deviceId === user.activeDevice && !device.isActive) ||
-                (device.deviceId !== user.activeDevice && device.isActive)
+            const needsUpdate = user.devices.some(
+                (device) =>
+                    (device.deviceId === user.activeDevice && !device.isActive) ||
+                    (device.deviceId !== user.activeDevice && device.isActive),
             )
 
             if (needsUpdate) {
@@ -47,7 +48,7 @@ exports.getDevices = async (req, res) => {
             success: true,
             devices: user.devices,
             activeDevice: user.activeDevice,
-            hasActiveSubscription
+            hasActiveSubscription,
         })
     } catch (error) {
         console.error("Get devices error:", error)
@@ -113,16 +114,16 @@ exports.setActiveDevice = async (req, res) => {
         }
 
         // Update active device status for all devices
-        user.devices = user.devices.map(device => ({
-            ...device,
-            isActive: device.deviceId === deviceId
+        user.devices = user.devices.map((d) => ({
+            ...(d.toObject ? d.toObject() : d), // Ensure plain object spread
+            isActive: d.deviceId === deviceId,
         }))
 
         // Update active device field
         user.activeDevice = deviceId
 
         // Update last active timestamp for the device
-        const deviceIndex = user.devices.findIndex(device => device.deviceId === deviceId)
+        const deviceIndex = user.devices.findIndex((device) => device.deviceId === deviceId)
         if (deviceIndex !== -1) {
             user.devices[deviceIndex].lastActive = new Date()
         }

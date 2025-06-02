@@ -1,15 +1,13 @@
 const GroupCall = require("../models/group-call")
-const User = require("../models/user")
-const Conversation = require("../models/conversation")
-const mongoose = require("mongoose")
+const Conversation = require("../models/Conversation")
+const { getSocketInstance } = require("../utils/socket-utils") // ✅ Use the socket manager
 
 // Create a new group call
 exports.createGroupCall = async (req, res) => {
     try {
-        const userId = req.userId // From auth middleware
-        const { conversationId, type, name } = req.body
+        const userId = req.userId
+        const { conversationId, type, name, initialParticipants = [] } = req.body
 
-        // Validate input
         if (!conversationId || !type || !["audio", "video"].includes(type)) {
             return res.status(400).json({
                 success: false,
@@ -17,12 +15,7 @@ exports.createGroupCall = async (req, res) => {
             })
         }
 
-        // Check if conversation exists and user is a participant
-        const conversation = await Conversation.findOne({
-            _id: conversationId,
-            participants: userId,
-        })
-
+        const conversation = await Conversation.findOne({ _id: conversationId, participants: userId })
         if (!conversation) {
             return res.status(404).json({
                 success: false,
@@ -30,513 +23,477 @@ exports.createGroupCall = async (req, res) => {
             })
         }
 
-        // Check if there's already an active group call in this conversation
         const existingActiveCall = await GroupCall.findOne({
             conversationId,
-            status: "active",
+            status: { $in: ["connecting", "ringing", "active"] },
         })
-
         if (existingActiveCall) {
             return res.status(400).json({
                 success: false,
-                message: "There is already an active call in this conversation",
-                callId: existingActiveCall._id,
+                message: "There is already an active call in this conversation. You might want to join it.",
+                call: existingActiveCall,
             })
         }
 
-        // Create new group call
+        const callParticipants = [
+            {
+                user: userId,
+                isActive: true,
+                joinedAt: new Date(),
+                isMuted: false,
+                isVideoOff: type === "audio",
+                isSharingScreen: false,
+            },
+        ]
+
+        initialParticipants.forEach((p) => {
+            if (p.userId && p.userId.toString() !== userId.toString()) {
+                callParticipants.push({
+                    user: p.userId,
+                    isActive: false,
+                    targetDeviceId: p.targetDeviceId,
+                    isMuted: false,
+                    isVideoOff: type === "audio",
+                    isSharingScreen: false,
+                })
+            }
+        })
+
         const newGroupCall = new GroupCall({
-            name: name || `${conversation.isGroup ? conversation.groupName : "Call"}`,
+            name:
+                name ||
+                (conversation.isGroup
+                    ? conversation.groupName
+                    : `Call with ${conversation.participants.find((p) => p._id.toString() !== userId.toString())?.name || "User"}`),
             initiator: userId,
-            participants: [{ user: userId }], // Add initiator as first participant
+            participants: callParticipants,
             conversationId,
             type,
+            status: "connecting",
         })
 
         await newGroupCall.save()
+        await newGroupCall.populate([
+            { path: "initiator", select: "_id name phoneNumber profilePicture" },
+            { path: "participants.user", select: "_id name phoneNumber profilePicture" },
+        ])
 
-        // Populate initiator info
-        await newGroupCall.populate("initiator", "_id name phoneNumber profilePicture")
-        await newGroupCall.populate("participants.user", "_id name phoneNumber profilePicture")
+        // ✅ GET SOCKET INSTANCE SAFELY
+        try {
+            const io = getSocketInstance()
 
-        res.status(201).json({
-            success: true,
-            groupCall: newGroupCall,
-        })
+            initialParticipants.forEach((p) => {
+                if (p.userId && p.userId.toString() !== userId.toString()) {
+                    const participantDetail = newGroupCall.participants.find(
+                        (callP) => callP.user._id.toString() === p.userId.toString(),
+                    )
+                    io.to(p.userId.toString()).emit("incoming-group-call", {
+                        call: newGroupCall,
+                        targetDeviceId: p.targetDeviceId,
+                    })
+                }
+            })
+        } catch (socketError) {
+            console.error("Socket not available:", socketError.message)
+            // Continue without socket emission - the call is still created
+        }
+
+        res.status(201).json({ success: true, groupCall: newGroupCall })
     } catch (error) {
         console.error("Create group call error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while creating group call",
-        })
+        res.status(500).json({ success: false, message: "Server error: " + error.message })
     }
 }
 
 // Join a group call
 exports.joinGroupCall = async (req, res) => {
     try {
-        const userId = req.userId // From auth middleware
+        const userId = req.userId
         const { groupCallId } = req.params
-        const { connectionIds = [] } = req.body
 
-        // Find the group call
         const groupCall = await GroupCall.findById(groupCallId)
         if (!groupCall) {
-            return res.status(404).json({
-                success: false,
-                message: "Group call not found",
-            })
+            return res.status(404).json({ success: false, message: "Group call not found" })
         }
 
-        // Check if call is active
-        if (groupCall.status !== "active") {
-            return res.status(400).json({
-                success: false,
-                message: "This call has ended",
-            })
+        if (!["connecting", "ringing", "active"].includes(groupCall.status)) {
+            return res.status(400).json({ success: false, message: "Call cannot be joined or has ended." })
         }
 
-        // Check if user is allowed to join (part of the conversation)
-        const conversation = await Conversation.findOne({
-            _id: groupCall.conversationId,
-            participants: userId,
-        })
-
+        const conversation = await Conversation.findOne({ _id: groupCall.conversationId, participants: userId })
         if (!conversation) {
-            return res.status(403).json({
-                success: false,
-                message: "You are not allowed to join this call",
-            })
+            return res.status(403).json({ success: false, message: "You are not allowed to join this call" })
         }
 
-        // Check if maximum participants limit is reached
-        const activeParticipants = groupCall.participants.filter((p) => p.isActive)
-        if (activeParticipants.length >= groupCall.maxParticipants) {
-            return res.status(400).json({
-                success: false,
-                message: `Maximum number of participants (${groupCall.maxParticipants}) reached`,
-            })
+        const activeParticipantsCount = groupCall.participants.filter((p) => p.isActive).length
+        if (activeParticipantsCount >= (groupCall.maxParticipants || 10)) {
+            return res.status(400).json({ success: false, message: `Maximum participants reached.` })
         }
 
-        // Check if user is already in the call
-        const participantIndex = groupCall.participants.findIndex((p) => p.user.toString() === userId)
+        const participantEntry = groupCall.participants.find((p) => p.user.toString() === userId)
 
-        if (participantIndex !== -1) {
-            // User is rejoining
-            groupCall.participants[participantIndex].isActive = true
-            groupCall.participants[participantIndex].joinedAt = new Date()
-            groupCall.participants[participantIndex].leftAt = null
-            groupCall.participants[participantIndex].connectionIds = connectionIds
+        if (participantEntry) {
+            if (!participantEntry.isActive) {
+                participantEntry.isActive = true
+                participantEntry.joinedAt = new Date()
+                participantEntry.leftAt = null
+            }
         } else {
-            // New participant
             groupCall.participants.push({
                 user: userId,
-                connectionIds,
+                isActive: true,
+                joinedAt: new Date(),
+                isMuted: false,
+                isVideoOff: groupCall.type === "audio",
+                isSharingScreen: false,
             })
+        }
+
+        if (
+            (groupCall.status === "connecting" || groupCall.status === "ringing") &&
+            groupCall.participants.filter((p) => p.isActive).length > 0
+        ) {
+            groupCall.status = "active"
+            if (!groupCall.startTime) {
+                groupCall.startTime = new Date()
+            }
         }
 
         await groupCall.save()
+        await groupCall.populate([
+            { path: "initiator", select: "_id name phoneNumber profilePicture" },
+            { path: "participants.user", select: "_id name phoneNumber profilePicture" },
+        ])
 
-        // Populate participant info
-        await groupCall.populate("participants.user", "_id name phoneNumber profilePicture")
-        await groupCall.populate("initiator", "_id name phoneNumber profilePicture")
+        // ✅ GET SOCKET INSTANCE SAFELY
+        try {
+            const io = getSocketInstance()
+            const updatedParticipantInfo = groupCall.participants.find((p) => p.user._id.toString() === userId)
 
-        res.status(200).json({
-            success: true,
-            groupCall,
-        })
+            groupCall.participants.forEach((p) => {
+                if (p.isActive && p.user._id.toString() !== userId) {
+                    io.to(p.user._id.toString()).emit("participant-joined-group-call", {
+                        callId: groupCall._id,
+                        participant: updatedParticipantInfo,
+                    })
+                }
+            })
+        } catch (socketError) {
+            console.error("Socket not available:", socketError.message)
+        }
+
+        res.status(200).json({ success: true, groupCall })
     } catch (error) {
         console.error("Join group call error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while joining group call",
-        })
+        res.status(500).json({ success: false, message: "Server error: " + error.message })
     }
 }
 
 // Leave a group call
 exports.leaveGroupCall = async (req, res) => {
     try {
-        const userId = req.userId // From auth middleware
+        const userId = req.userId
         const { groupCallId } = req.params
 
-        // Find the group call
         const groupCall = await GroupCall.findById(groupCallId)
         if (!groupCall) {
-            return res.status(404).json({
-                success: false,
-                message: "Group call not found",
-            })
+            return res.status(404).json({ success: false, message: "Group call not found" })
+        }
+        if (groupCall.status === "ended" || groupCall.status === "completed") {
+            return res.status(400).json({ success: false, message: "Call has already ended." })
         }
 
-        // Find participant
-        const participantIndex = groupCall.participants.findIndex((p) => p.user.toString() === userId)
-        if (participantIndex === -1) {
-            return res.status(400).json({
-                success: false,
-                message: "You are not a participant in this call",
-            })
+        const participantEntry = groupCall.participants.find((p) => p.user.toString() === userId)
+        if (participantEntry && participantEntry.isActive) {
+            participantEntry.isActive = false
+            participantEntry.leftAt = new Date()
+            participantEntry.isSharingScreen = false
+
+            const activeParticipants = groupCall.participants.filter((p) => p.isActive)
+            if (activeParticipants.length === 0) {
+                groupCall.status = "ended"
+                groupCall.endTime = new Date()
+                if (groupCall.startTime) {
+                    const durationMs = new Date(groupCall.endTime) - new Date(groupCall.startTime)
+                    groupCall.duration = Math.round(durationMs / 1000)
+                }
+                groupCall.endReason = "All participants left"
+            }
+
+            await groupCall.save()
+            await groupCall.populate([
+                { path: "initiator", select: "_id name phoneNumber profilePicture" },
+                { path: "participants.user", select: "_id name phoneNumber profilePicture" },
+            ])
+
+            // ✅ GET SOCKET INSTANCE SAFELY
+            try {
+                const io = getSocketInstance()
+                const leftParticipantInfo = groupCall.participants.find((p) => p.user._id.toString() === userId)
+
+                groupCall.participants.forEach((p) => {
+                    if (p.isActive) {
+                        io.to(p.user._id.toString()).emit("participant-left-group-call", {
+                            callId: groupCall._id,
+                            participantId: userId,
+                            participant: leftParticipantInfo,
+                        })
+                    }
+                })
+
+                if (groupCall.status === "ended") {
+                    groupCall.participants.forEach((p) => {
+                        io.to(p.user._id.toString()).emit("group-call-ended", {
+                            callId: groupCall._id,
+                            reason: groupCall.endReason,
+                        })
+                    })
+                }
+            } catch (socketError) {
+                console.error("Socket not available:", socketError.message)
+            }
+
+            res.status(200).json({ success: true, message: "Successfully left the call", groupCall })
+        } else {
+            return res.status(400).json({ success: false, message: "You are not an active participant in this call." })
         }
-
-        // Mark participant as inactive
-        groupCall.participants[participantIndex].isActive = false
-        groupCall.participants[participantIndex].leftAt = new Date()
-        groupCall.participants[participantIndex].sharingScreen = false
-
-        // Check if all participants have left
-        const anyActiveParticipant = groupCall.participants.some((p) => p.isActive)
-        if (!anyActiveParticipant) {
-            // End the call if no active participants
-            groupCall.status = "ended"
-            groupCall.endTime = new Date()
-
-            // Calculate duration in seconds
-            const startTime = new Date(groupCall.startTime)
-            const endTime = new Date(groupCall.endTime)
-            const durationMs = endTime - startTime
-            groupCall.duration = Math.round(durationMs / 1000) // Convert to seconds
-        }
-
-        await groupCall.save()
-
-        res.status(200).json({
-            success: true,
-            message: "Left group call successfully",
-            callEnded: !anyActiveParticipant,
-        })
     } catch (error) {
         console.error("Leave group call error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while leaving group call",
-        })
+        res.status(500).json({ success: false, message: "Server error: " + error.message })
     }
 }
 
-// End a group call (only initiator can end for everyone)
+// End a group call (typically by initiator)
 exports.endGroupCall = async (req, res) => {
     try {
-        const userId = req.userId // From auth middleware
+        const userId = req.userId
         const { groupCallId } = req.params
 
-        // Find the group call
         const groupCall = await GroupCall.findById(groupCallId)
         if (!groupCall) {
-            return res.status(404).json({
-                success: false,
-                message: "Group call not found",
-            })
+            return res.status(404).json({ success: false, message: "Group call not found" })
         }
 
-        // Check if user is the initiator
         if (groupCall.initiator.toString() !== userId) {
-            return res.status(403).json({
-                success: false,
-                message: "Only the call initiator can end the call for everyone",
-            })
+            return res.status(403).json({ success: false, message: "Only the call initiator can end the call for everyone." })
         }
 
-        // End the call
+        if (groupCall.status === "ended" || groupCall.status === "completed") {
+            return res.status(400).json({ success: false, message: "Call has already ended." })
+        }
+
         groupCall.status = "ended"
         groupCall.endTime = new Date()
+        groupCall.endReason = "Call ended by initiator"
+        if (groupCall.startTime) {
+            const durationMs = new Date(groupCall.endTime) - new Date(groupCall.startTime)
+            groupCall.duration = Math.round(durationMs / 1000)
+        }
 
-        // Mark all participants as inactive
-        groupCall.participants.forEach((participant) => {
-            if (participant.isActive) {
-                participant.isActive = false
-                participant.leftAt = new Date()
-                participant.sharingScreen = false
+        groupCall.participants.forEach((p) => {
+            if (p.isActive) {
+                p.isActive = false
+                p.leftAt = groupCall.endTime
+                p.isSharingScreen = false
             }
         })
 
-        // Calculate duration in seconds
-        const startTime = new Date(groupCall.startTime)
-        const endTime = new Date(groupCall.endTime)
-        const durationMs = endTime - startTime
-        groupCall.duration = Math.round(durationMs / 1000) // Convert to seconds
-
         await groupCall.save()
+        await groupCall.populate([
+            { path: "initiator", select: "_id name phoneNumber profilePicture" },
+            { path: "participants.user", select: "_id name phoneNumber profilePicture" },
+        ])
 
-        res.status(200).json({
-            success: true,
-            message: "Group call ended successfully",
-        })
+        // ✅ GET SOCKET INSTANCE SAFELY
+        try {
+            const io = getSocketInstance()
+            groupCall.participants.forEach((p) => {
+                io.to(p.user._id.toString()).emit("group-call-ended", {
+                    callId: groupCall._id,
+                    reason: groupCall.endReason,
+                    callDetails: groupCall,
+                })
+            })
+        } catch (socketError) {
+            console.error("Socket not available:", socketError.message)
+        }
+
+        res.status(200).json({ success: true, message: "Group call ended successfully", groupCall })
     } catch (error) {
         console.error("End group call error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while ending group call",
-        })
+        res.status(500).json({ success: false, message: "Server error: " + error.message })
     }
 }
 
-// Get active group call in a conversation
-exports.getActiveGroupCall = async (req, res) => {
+// Update group call status
+exports.updateCallStatus = async (req, res) => {
     try {
-        const userId = req.userId // From auth middleware
-        const { conversationId } = req.params
-
-        // Check if conversation exists and user is a participant
-        const conversation = await Conversation.findOne({
-            _id: conversationId,
-            participants: userId,
-        })
-
-        if (!conversation) {
-            return res.status(404).json({
-                success: false,
-                message: "Conversation not found or you are not a participant",
-            })
-        }
-
-        // Find active group call in this conversation
-        const activeGroupCall = await GroupCall.findOne({
-            conversationId,
-            status: "active",
-        })
-            .populate("initiator", "_id name phoneNumber profilePicture")
-            .populate("participants.user", "_id name phoneNumber profilePicture")
-
-        if (!activeGroupCall) {
-            return res.status(404).json({
-                success: false,
-                message: "No active call in this conversation",
-            })
-        }
-
-        res.status(200).json({
-            success: true,
-            groupCall: activeGroupCall,
-        })
-    } catch (error) {
-        console.error("Get active group call error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while fetching active group call",
-        })
-    }
-}
-
-// Get group call details
-exports.getGroupCallDetails = async (req, res) => {
-    try {
-        const userId = req.userId // From auth middleware
+        const userId = req.userId
         const { groupCallId } = req.params
+        const { status, reason, targetUserId } = req.body
 
-        // Find the group call
+        const allowedStatuses = ["connecting", "ringing", "active", "missed", "rejected", "failed", "ended", "completed"]
+        if (!status || !allowedStatuses.includes(status)) {
+            return res
+                .status(400)
+                .json({ success: false, message: `Valid status is required. Allowed: ${allowedStatuses.join(", ")}` })
+        }
+
         const groupCall = await GroupCall.findById(groupCallId)
-            .populate("initiator", "_id name phoneNumber profilePicture")
-            .populate("participants.user", "_id name phoneNumber profilePicture")
-
         if (!groupCall) {
-            return res.status(404).json({
-                success: false,
-                message: "Group call not found",
-            })
+            return res.status(404).json({ success: false, message: "Group call not found" })
         }
 
-        // Check if user is a participant or was in the call
-        const isParticipant = groupCall.participants.some((p) => p.user._id.toString() === userId)
-        if (!isParticipant) {
-            return res.status(403).json({
-                success: false,
-                message: "You are not authorized to view this call",
-            })
+        let statusUpdated = false
+
+        if (targetUserId) {
+            const participant = groupCall.participants.find((p) => p.user.toString() === targetUserId)
+            if (participant) {
+                if (status === "missed" || status === "rejected") {
+                    participant.isActive = false
+                    participant.callStatus = status
+                    participant.leftAt = new Date()
+                    statusUpdated = true
+
+                    const activeParticipants = groupCall.participants.filter((p) => p.isActive)
+                    const pendingParticipants = groupCall.participants.filter(
+                        (p) => !p.callStatus && !p.isActive && p.user.toString() !== groupCall.initiator.toString(),
+                    )
+
+                    if (activeParticipants.length <= 1 && pendingParticipants.length === 0 && groupCall.status !== "active") {
+                        groupCall.status = "failed"
+                        groupCall.endTime = new Date()
+                        groupCall.endReason = "No participants joined"
+                        if (groupCall.startTime) {
+                            const durationMs = new Date(groupCall.endTime) - new Date(groupCall.startTime)
+                            groupCall.duration = Math.round(durationMs / 1000)
+                        }
+                        groupCall.participants.forEach((p) => {
+                            if (p.isActive) p.isActive = false
+                            if (!p.leftAt) p.leftAt = new Date()
+                        })
+                    }
+                }
+            }
+        } else {
+            groupCall.status = status
+            statusUpdated = true
+            if (reason) {
+                groupCall.endReason = reason
+            }
+            if (["ended", "completed", "failed"].includes(status)) {
+                groupCall.endTime = groupCall.endTime || new Date()
+                if (
+                    !groupCall.startTime &&
+                    status === "failed" &&
+                    groupCall.participants.filter((p) => p.isActive).length <= 1
+                ) {
+                    // No start time, means call never really started.
+                } else if (groupCall.startTime) {
+                    const durationMs = new Date(groupCall.endTime) - new Date(groupCall.startTime)
+                    groupCall.duration = Math.round(durationMs / 1000)
+                }
+                groupCall.participants.forEach((p) => {
+                    if (p.isActive) {
+                        p.isActive = false
+                        p.leftAt = groupCall.endTime
+                        p.isSharingScreen = false
+                    }
+                })
+            } else if (status === "active" && !groupCall.startTime) {
+                groupCall.startTime = new Date()
+            }
         }
 
-        res.status(200).json({
-            success: true,
-            groupCall,
-        })
+        if (statusUpdated) await groupCall.save()
+        else return res.status(400).json({ success: false, message: "No status changes applied." })
+
+        await groupCall.populate([
+            { path: "initiator", select: "_id name phoneNumber profilePicture" },
+            { path: "participants.user", select: "_id name phoneNumber profilePicture" },
+        ])
+
+        // ✅ GET SOCKET INSTANCE SAFELY
+        try {
+            const io = getSocketInstance()
+            groupCall.participants.forEach((p) => {
+                io.to(p.user._id.toString()).emit("group-call-status-updated", {
+                    callId: groupCall._id,
+                    status: groupCall.status,
+                    participantId: targetUserId,
+                    participantStatus: targetUserId ? status : undefined,
+                    reason: reason,
+                    callDetails: groupCall,
+                })
+            })
+            if (["ended", "completed", "failed"].includes(groupCall.status)) {
+                groupCall.participants.forEach((p) => {
+                    io.to(p.user._id.toString()).emit("group-call-ended", {
+                        callId: groupCall._id,
+                        reason: groupCall.endReason,
+                        callDetails: groupCall,
+                    })
+                })
+            }
+        } catch (socketError) {
+            console.error("Socket not available:", socketError.message)
+        }
+
+        res.status(200).json({ success: true, message: `Group call status updated`, groupCall })
     } catch (error) {
-        console.error("Get group call details error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while fetching group call details",
-        })
+        console.error("Update group call status error:", error)
+        res.status(500).json({ success: false, message: "Server error: " + error.message })
     }
 }
 
-// Get group call history
-exports.getGroupCallHistory = async (req, res) => {
-    try {
-        const userId = req.userId // From auth middleware
-        const { conversationId } = req.query
-        const { page = 1, limit = 20 } = req.query
-
-        // Calculate skip value for pagination
-        const skip = (Number.parseInt(page) - 1) * Number.parseInt(limit)
-
-        // Build query
-        const query = {
-            "participants.user": userId,
-        }
-
-        // Add conversation filter if provided
-        if (conversationId) {
-            query.conversationId = conversationId
-        }
-
-        // Find all group calls where user was a participant
-        const groupCalls = await GroupCall.find(query)
-            .sort({ startTime: -1 }) // Sort by most recent first
-            .skip(skip)
-            .limit(Number.parseInt(limit))
-            .populate("initiator", "_id name phoneNumber profilePicture")
-            .populate("participants.user", "_id name phoneNumber profilePicture")
-            .populate("conversationId", "groupName isGroup")
-
-        // Get total count for pagination
-        const totalCalls = await GroupCall.countDocuments(query)
-
-        res.status(200).json({
-            success: true,
-            groupCalls,
-            pagination: {
-                page: Number.parseInt(page),
-                limit: Number.parseInt(limit),
-                totalCalls,
-                totalPages: Math.ceil(totalCalls / Number.parseInt(limit)),
-            },
-        })
-    } catch (error) {
-        console.error("Get group call history error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while fetching group call history",
-        })
-    }
-}
-
-// Toggle screen sharing
+// Toggle screen sharing for a participant
 exports.toggleScreenSharing = async (req, res) => {
     try {
-        const userId = req.userId // From auth middleware
+        const userId = req.userId
         const { groupCallId } = req.params
         const { isSharing } = req.body
 
-        // Validate input
-        if (isSharing === undefined) {
-            return res.status(400).json({
-                success: false,
-                message: "isSharing parameter is required",
-            })
+        if (typeof isSharing !== "boolean") {
+            return res.status(400).json({ success: false, message: "isSharing (boolean) is required in the body." })
         }
 
-        // Find the group call
         const groupCall = await GroupCall.findById(groupCallId)
-        if (!groupCall) {
-            return res.status(404).json({
-                success: false,
-                message: "Group call not found",
-            })
+        if (!groupCall || groupCall.status !== "active") {
+            return res.status(404).json({ success: false, message: "Active group call not found" })
         }
 
-        // Check if call is active
-        if (groupCall.status !== "active") {
-            return res.status(400).json({
-                success: false,
-                message: "This call has ended",
-            })
+        const participantEntry = groupCall.participants.find((p) => p.user.toString() === userId && p.isActive)
+        if (!participantEntry) {
+            return res.status(403).json({ success: false, message: "You are not an active participant in this call." })
         }
 
-        // Find participant
-        const participantIndex = groupCall.participants.findIndex((p) => p.user.toString() === userId && p.isActive)
-        if (participantIndex === -1) {
-            return res.status(400).json({
-                success: false,
-                message: "You are not an active participant in this call",
-            })
-        }
-
-        // If turning on screen sharing, check if anyone else is already sharing
-        if (isSharing) {
-            const someoneElseSharing = groupCall.participants.some(
-                (p) => p.sharingScreen && p.user.toString() !== userId && p.isActive,
-            )
-            if (someoneElseSharing) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Another participant is already sharing their screen",
-                })
-            }
-        }
-
-        // Update screen sharing status
-        groupCall.participants[participantIndex].sharingScreen = isSharing
+        participantEntry.isSharingScreen = isSharing
         await groupCall.save()
 
-        // Populate participant info
-        await groupCall.populate("participants.user", "_id name phoneNumber profilePicture")
+        await groupCall.populate([{ path: "participants.user", select: "_id name phoneNumber profilePicture" }])
 
-        res.status(200).json({
-            success: true,
-            message: isSharing ? "Screen sharing started" : "Screen sharing stopped",
-            groupCall,
-        })
+        // ✅ GET SOCKET INSTANCE SAFELY
+        try {
+            const io = getSocketInstance()
+            const updatedParticipantInfo = groupCall.participants.find((p) => p.user._id.toString() === userId)
+
+            groupCall.participants.forEach((p) => {
+                if (p.isActive) {
+                    io.to(p.user._id.toString()).emit("participant-screen-share-toggled", {
+                        callId: groupCall._id,
+                        participantId: userId,
+                        isSharingScreen: isSharing,
+                        participant: updatedParticipantInfo,
+                    })
+                }
+            })
+        } catch (socketError) {
+            console.error("Socket not available:", socketError.message)
+        }
+
+        res.status(200).json({ success: true, message: `Screen sharing ${isSharing ? "started" : "stopped"}`, groupCall })
     } catch (error) {
         console.error("Toggle screen sharing error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while toggling screen sharing",
-        })
-    }
-}
-
-// Update connection IDs for a participant
-exports.updateConnectionIds = async (req, res) => {
-    try {
-        const userId = req.userId // From auth middleware
-        const { groupCallId } = req.params
-        const { connectionIds } = req.body
-
-        // Validate input
-        if (!connectionIds || !Array.isArray(connectionIds)) {
-            return res.status(400).json({
-                success: false,
-                message: "connectionIds array is required",
-            })
-        }
-
-        // Find the group call
-        const groupCall = await GroupCall.findById(groupCallId)
-        if (!groupCall) {
-            return res.status(404).json({
-                success: false,
-                message: "Group call not found",
-            })
-        }
-
-        // Check if call is active
-        if (groupCall.status !== "active") {
-            return res.status(400).json({
-                success: false,
-                message: "This call has ended",
-            })
-        }
-
-        // Find participant
-        const participantIndex = groupCall.participants.findIndex((p) => p.user.toString() === userId && p.isActive)
-        if (participantIndex === -1) {
-            return res.status(400).json({
-                success: false,
-                message: "You are not an active participant in this call",
-            })
-        }
-
-        // Update connection IDs
-        groupCall.participants[participantIndex].connectionIds = connectionIds
-        await groupCall.save()
-
-        res.status(200).json({
-            success: true,
-            message: "Connection IDs updated successfully",
-        })
-    } catch (error) {
-        console.error("Update connection IDs error:", error)
-        res.status(500).json({
-            success: false,
-            message: "Server error while updating connection IDs",
-        })
+        res.status(500).json({ success: false, message: "Server error: " + error.message })
     }
 }

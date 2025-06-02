@@ -24,11 +24,16 @@ exports.register = async (req, res) => {
             })
         }
 
+        // Check if this is the first user (to make them admin)
+        const userCount = await User.countDocuments()
+        const isFirstUser = userCount === 0
+
         const newUser = new User({
             phoneNumber,
             password,
             name: name || "",
             isVerified: false,
+            isAdmin: isFirstUser, // First user becomes admin
         })
 
         await newUser.save()
@@ -50,6 +55,7 @@ exports.register = async (req, res) => {
             success: true,
             message: `Registration initiated. OTP sent via ${otpResult.method || "message"}. Please verify your phone number.`,
             userId: newUser._id,
+            isAdmin: isFirstUser,
         })
     } catch (error) {
         console.error("Registration error:", error)
@@ -117,6 +123,7 @@ exports.verifyOTP = async (req, res) => {
                     name: user.name,
                     profilePicture: user.profilePicture,
                     isVerified: user.isVerified,
+                    isAdmin: user.isAdmin,
                 },
             })
         }
@@ -235,6 +242,29 @@ exports.login = async (req, res) => {
             })
         }
 
+        // Check if user is suspended
+        if (user.isSuspended) {
+            // Check if suspension has expired
+            if (user.suspensionDetails?.expiresAt && new Date() > new Date(user.suspensionDetails.expiresAt)) {
+                // Auto-unsuspend if expired
+                user.isSuspended = false
+                user.suspensionDetails = undefined
+                await user.save()
+            } else {
+                const suspensionMessage = user.suspensionDetails?.reason
+                    ? `Account suspended: ${user.suspensionDetails.reason}`
+                    : "Your account has been suspended. Please contact support."
+
+                return res.status(403).json({
+                    success: false,
+                    message: suspensionMessage,
+                    status: "suspended",
+                    suspendedAt: user.suspensionDetails?.suspendedAt,
+                    expiresAt: user.suspensionDetails?.expiresAt,
+                })
+            }
+        }
+
         // Verify password
         const isPasswordValid = await user.comparePassword(password)
         if (!isPasswordValid) {
@@ -293,6 +323,7 @@ exports.login = async (req, res) => {
                 about: user.about,
                 activeDevice: user.activeDevice,
                 devices: user.devices,
+                isAdmin: user.isAdmin,
             },
         })
     } catch (error) {

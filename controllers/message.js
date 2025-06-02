@@ -3,6 +3,7 @@ const Conversation = require("../models/conversation")
 const mongoose = require("mongoose")
 const path = require("path")
 const upload = require("../middleware/upload")
+const { sendMessageNotification } = require("../controllers/notification");
 
 // Send message
 exports.sendMessage = async (req, res) => {
@@ -22,12 +23,21 @@ exports.sendMessage = async (req, res) => {
         const conversation = await Conversation.findOne({
             _id: conversationId,
             participants: userId,
-        })
+        }).populate("participants", "_id name phoneNumber profilePicture")
 
         if (!conversation) {
             return res.status(404).json({
                 success: false,
                 message: "Conversation not found or you are not a participant",
+            })
+        }
+
+        // Find sender info for notification
+        const sender = conversation.participants.find(p => p._id.toString() === userId);
+        if (!sender) {
+            return res.status(404).json({
+                success: false,
+                message: "Sender not found in conversation participants",
             })
         }
 
@@ -132,6 +142,12 @@ exports.sendMessage = async (req, res) => {
 
             await conversation.save();
 
+            // Send notification for the last message only (to avoid notification spam)
+            if (messages.length > 0) {
+                const lastMessage = messages[messages.length - 1];
+                await sendMessageNotification(lastMessage, conversation, sender);
+            }
+
             return res.status(201).json({
                 success: true,
                 messages: messages,
@@ -206,6 +222,9 @@ exports.sendMessage = async (req, res) => {
             })
         }
 
+        // Send notification for the new message
+        await sendMessageNotification(newMessage, conversation, sender);
+
         res.status(201).json({
             success: true,
             message: newMessage,
@@ -219,7 +238,6 @@ exports.sendMessage = async (req, res) => {
         })
     }
 }
-
 // Get messages for a conversation
 exports.getMessages = async (req, res) => {
     try {
