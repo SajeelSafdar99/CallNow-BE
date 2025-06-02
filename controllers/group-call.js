@@ -1,5 +1,5 @@
 const GroupCall = require("../models/group-call")
-const Conversation = require("../models/Conversation")
+const Conversation = require("../models/conversation")
 const { getSocketInstance } = require("../utils/socket-utils") // ✅ Use the socket manager
 
 // Create a new group call

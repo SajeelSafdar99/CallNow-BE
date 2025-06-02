@@ -17,7 +17,7 @@ app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use(
     cors({
-        origin: ["http://127.0.0.1:5173", "http://192.168.10.53:5173", "http://192.168.10.13:5173"], // Ensure all client origins are listed
+        origin: "*", // Allow all origins
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: "*", // Consider being more specific for production
         credentials: true,
@@ -65,6 +65,16 @@ app.use("/api/subscriptions", subscriptionRoutes)
 app.use("/api/notifications", notificationRoutes)
 app.use("/api/admin", adminRoutes)
 
+// Test endpoint to check server status
+app.get("/api/test-server-status", (req, res) => {
+    console.log("GET /api/test-server-status hit");
+    res.status(200).json({
+        message: "Server is up and running!",
+        timestamp: new Date().toISOString(),
+        status: "OK",
+    });
+});
+
 const PORT = process.env.PORT || 4000
 const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`))
 
@@ -72,7 +82,7 @@ const server = app.listen(PORT, () => console.log(`Server running on port ${PORT
 const { Server } = require("socket.io")
 const io = new Server(server, {
     cors: {
-        origin: ["http://127.0.0.1:5173", "http://192.168.10.13:5173", "http://192.168.10.53:5173"], // Ensure all client origins are listed
+        origin: "*", // Allow all origins
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: ["Content-Type", "Authorization"],
         credentials: true,
