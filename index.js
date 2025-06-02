@@ -17,7 +17,7 @@ app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use(
     cors({
-        origin: "*", // Allow all origins
+        origin: ["http://127.0.0.1:5173", "http://192.168.10.53:5173", "http://192.168.10.13:5173"], // Ensure all client origins are listed
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: "*", // Consider being more specific for production
         credentials: true,
@@ -65,16 +65,6 @@ app.use("/api/subscriptions", subscriptionRoutes)
 app.use("/api/notifications", notificationRoutes)
 app.use("/api/admin", adminRoutes)
 
-// Test endpoint to check server status
-app.get("/api/test-server-status", (req, res) => {
-    console.log("GET /api/test-server-status hit");
-    res.status(200).json({
-        message: "Server is up and running!",
-        timestamp: new Date().toISOString(),
-        status: "OK",
-    });
-});
-
 const PORT = process.env.PORT || 4000
 const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`))
 
@@ -82,7 +72,7 @@ const server = app.listen(PORT, () => console.log(`Server running on port ${PORT
 const { Server } = require("socket.io")
 const io = new Server(server, {
     cors: {
-        origin: "*", // Allow all origins
+        origin: ["http://127.0.0.1:5173", "http://192.168.10.13:5173", "http://192.168.10.53:5173"], // Ensure all client origins are listed
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: ["Content-Type", "Authorization"],
         credentials: true,
@@ -617,6 +607,44 @@ io.on("connection", (socket) => {
         // Send list of existing participants to the new joiner
         socket.emit("existing-group-participants", { callId: groupId, participants: existingParticipants })
 
+        const newParticipantPayloadForLogging = {
+            callId: groupId,
+            participant: {
+                userId: socket.userId,
+                name: socket.user?.name || "Unknown User",
+                profilePicture: socket.user?.profilePicture || "",
+                socketId: socket.id,
+                deviceId: socket.deviceId,
+            },
+        }
+
+        console.log(
+            `[Server Index.js] About to emit 'participant-joined-group' to room ${roomName} for new participant ${socket.userId} (Socket: ${socket.id}). Payload:`,
+            JSON.stringify(newParticipantPayloadForLogging),
+        )
+
+        // Log details about who the event is being sent to
+        const socketsInRoomForBroadcast = await io.in(roomName).fetchSockets() // Re-fetch or use socketsInRoom if still valid and sender is filtered
+        socketsInRoomForBroadcast.forEach((s_in_room) => {
+            if (s_in_room.id !== socket.id) {
+                // Ensure not to log for the sender itself regarding this broadcast
+                console.log(
+                    `[Server Index.js] Emitting 'participant-joined-group' to existing participant ${s_in_room.userId} (Socket: ${s_in_room.id}, Device: ${s_in_room.deviceId}) in room ${roomName}.`,
+                )
+            }
+        })
+
+        // This is the existing emit, ensure its payload is correct
+        socket.to(roomName).emit("participant-joined-group", {
+            callId: groupId,
+            participant: {
+                userId: socket.userId,
+                name: socket.user?.name || "Unknown User",
+                profilePicture: socket.user?.profilePicture || "",
+                socketId: socket.id, // Important for direct WebRTC signaling
+                deviceId: socket.deviceId,
+            },
+        })
         // Notify other participants about the new joiner
         socket.to(roomName).emit("participant-joined-group", {
             callId: groupId,
