@@ -8,5 +8,12 @@
       <jdbc-url>mongodb://localhost:27017/callnow</jdbc-url>
       <working-dir>$ProjectFileDir$</working-dir>
     </data-source>
+    <data-source source="LOCAL" name="callnow@cluster0.5w0xr.mongodb.net" uuid="5208309d-aded-4f62-9c8c-f2213a195e8d">
+      <driver-ref>mongo.4</driver-ref>
+      <synchronize>true</synchronize>
+      <jdbc-driver>com.dbschema.MongoJdbcDriver</jdbc-driver>
+      <jdbc-url>mongodb+srv://cluster0.5w0xr.mongodb.net/callnow?retryWrites=true&amp;w=majority&amp;appName=Cluster0</jdbc-url>
+      <working-dir>$ProjectFileDir$</working-dir>
+    </data-source>
   </component>
 </project>

@@ -17,7 +17,7 @@ app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use(
     cors({
-        origin: ["http://127.0.0.1:5173", "http://192.168.10.53:5173", "http://192.168.10.13:5173"], // Ensure all client origins are listed
+        origin: "*", // Allow all origins
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: "*", // Consider being more specific for production
         credentials: true,
@@ -65,6 +65,16 @@ app.use("/api/subscriptions", subscriptionRoutes)
 app.use("/api/notifications", notificationRoutes)
 app.use("/api/admin", adminRoutes)
 
+// Test endpoint to check server status
+app.get("/api/test-server-status", (req, res) => {
+    console.log("GET /api/test-server-status hit")
+    res.status(200).json({
+        message: "Server is up and running!",
+        timestamp: new Date().toISOString(),
+        status: "OK",
+    })
+})
+
 const PORT = process.env.PORT || 4000
 const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`))
 
@@ -72,7 +82,7 @@ const server = app.listen(PORT, () => console.log(`Server running on port ${PORT
 const { Server } = require("socket.io")
 const io = new Server(server, {
     cors: {
-        origin: ["http://127.0.0.1:5173", "http://192.168.10.13:5173", "http://192.168.10.53:5173"], // Ensure all client origins are listed
+        origin: "*", // Allow all origins
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: ["Content-Type", "Authorization"],
         credentials: true,
@@ -161,6 +171,16 @@ io.use(async (socket, next) => {
                 console.warn(`[Socket Auth] Middleware: User ${user._id} account is suspended.`)
                 return next(new Error("Account suspended"))
             }
+        }
+        const deviceExists = user.devices.some(device => device.deviceId === deviceIdFromAuth);
+        if (!deviceExists) {
+            console.warn(`[Socket Auth] Middleware: Device ${deviceIdFromAuth} not registered for user ${user._id}.`);
+            return next(new Error("Authentication error: Device not registered"));
+        }
+
+        // FIX: Log if connecting device is not the active device
+        if (user.activeDevice && user.activeDevice !== deviceIdFromAuth) {
+            console.warn(`[Socket Auth] Middleware: Device ${deviceIdFromAuth} connecting but not active device (${user.activeDevice}) for user ${user._id}.`);
         }
 
         socket.user = user // Store full user object
@@ -304,12 +324,16 @@ io.on("connection", (socket) => {
 
     socket.on("check-user-status", async ({ userId }) => {
         try {
-            const user = await User.findById(userId).select("devices name lastSeen")
+            const user = await User.findById(userId).select("devices name lastSeen activeDevice")
             if (user) {
                 let isOnline = false
-                let userActiveDeviceId = null
-                const dbActiveDevice = user.devices.find((device) => device.isActive)
-                if (dbActiveDevice) userActiveDeviceId = dbActiveDevice.deviceId
+                let userActiveDeviceId = user.activeDevice
+
+                // Fallback to device marked as active if activeDevice field is empty
+                if (!userActiveDeviceId) {
+                    const dbActiveDevice = user.devices.find((device) => device.isActive)
+                    if (dbActiveDevice) userActiveDeviceId = dbActiveDevice.deviceId
+                }
 
                 if (userDevices.has(userId)) {
                     for (const devId of userDevices.get(userId)) {
@@ -353,26 +377,41 @@ io.on("connection", (socket) => {
     // ===== ONE-TO-ONE CALL EVENTS =====
     socket.on("initiate-call", async ({ receiverId, callType, callId, offer, callerDeviceId }) => {
         try {
-            const actualCallerDeviceId = callerDeviceId || socket.deviceId
+            const actualCallerDeviceId = callerDeviceId || socket.deviceId;
             console.log(
                 `[Initiate Call] Received from caller ${socket.userId} (device: ${actualCallerDeviceId}) for receiver ${receiverId}. CallID: ${callId}, Type: ${callType}, Offer present: ${!!offer}`,
-            )
+            );
 
-            const receiver = await User.findById(receiverId).populate("devices")
+            const receiver = await User.findById(receiverId).populate("devices");
             if (!receiver) {
-                console.log(`[Initiate Call] Receiver ${receiverId} not found. CallID: ${callId}`)
-                socket.emit("call-initiation-failed", { callId, reason: "Receiver not found", toUserId: receiverId })
-                return
+                console.log(`[Initiate Call] Receiver ${receiverId} not found. CallID: ${callId}`);
+                socket.emit("call-initiation-failed", { callId, reason: "Receiver not found", toUserId: receiverId });
+                return;
             }
 
-            const activeReceiverDevice = receiver.devices.find((d) => d.isActive)
-            let targetReceiverDeviceId = activeReceiverDevice ? activeReceiverDevice.deviceId : null
+            // FIX: Use both activeDevice field and isActive flag for more reliable detection
+            let targetReceiverDeviceId = null;
 
+            // First check activeDevice field
+            if (receiver.activeDevice) {
+                targetReceiverDeviceId = receiver.activeDevice;
+                console.log(`[Initiate Call] Using activeDevice field: ${targetReceiverDeviceId}. CallID: ${callId}`);
+            }
+            // Fall back to isActive flag
+            else {
+                const activeReceiverDevice = receiver.devices.find((d) => d.isActive);
+                if (activeReceiverDevice) {
+                    targetReceiverDeviceId = activeReceiverDevice.deviceId;
+                    console.log(`[Initiate Call] Using isActive flag: ${targetReceiverDeviceId}. CallID: ${callId}`);
+                }
+            }
+
+            // If still no active device found, use first device as fallback
             if (!targetReceiverDeviceId && receiver.devices.length > 0) {
                 console.log(
                     `[Initiate Call] Receiver ${receiverId} has no active device, but has devices. Picking first one as target for now: ${receiver.devices[0].deviceId}. CallID: ${callId}`,
-                )
-                targetReceiverDeviceId = receiver.devices[0].deviceId
+                );
+                targetReceiverDeviceId = receiver.devices[0].deviceId;
             }
 
             const callPayload = {
@@ -386,37 +425,36 @@ io.on("connection", (socket) => {
                 callType,
                 offer,
                 targetDeviceId: targetReceiverDeviceId,
-            }
+            };
 
-            let receiverSocketInstance = null
+            let receiverSocketInstance = null;
             if (targetReceiverDeviceId) {
-                const receiverSocketId = deviceSockets.get(targetReceiverDeviceId)
+                const receiverSocketId = deviceSockets.get(targetReceiverDeviceId);
                 if (receiverSocketId) {
-                    receiverSocketInstance = io.sockets.sockets.get(receiverSocketId)
+                    receiverSocketInstance = io.sockets.sockets.get(receiverSocketId);
                 }
             }
 
             if (receiverSocketInstance) {
                 console.log(
                     `[Initiate Call] Emitting 'incoming-call-notification' to receiver ${receiverId} on device ${targetReceiverDeviceId} (Socket: ${receiverSocketInstance.id}). CallID: ${callId}.`,
-                )
-                receiverSocketInstance.emit("incoming-call-notification", callPayload)
+                );
+                receiverSocketInstance.emit("incoming-call-notification", callPayload);
             } else {
                 console.log(
                     `[Initiate Call] Receiver ${receiverId} (Device: ${targetReceiverDeviceId || "N/A"}) not connected. Sending push notification. CallID: ${callId}`,
-                )
+                );
                 await sendCallPushNotification(receiverId, {
                     callId: callPayload.callId,
                     callType: callPayload.callType,
                     caller: callPayload.caller,
-                })
+                });
             }
         } catch (error) {
-            console.error(`[Initiate Call] Error for callId ${callId}:`, error)
-            socket.emit("call-initiation-failed", { callId, reason: "Server error", toUserId: receiverId })
+            console.error(`[Initiate Call] Error for callId ${callId}:`, error);
+            socket.emit("call-initiation-failed", { callId, reason: "Server error", toUserId: receiverId });
         }
-    })
-
+    });
     socket.on("accept-call", ({ callId, callerId, answer, deviceId }) => {
         const accepterDeviceId = deviceId || socket.deviceId
         console.log(
@@ -607,44 +645,6 @@ io.on("connection", (socket) => {
         // Send list of existing participants to the new joiner
         socket.emit("existing-group-participants", { callId: groupId, participants: existingParticipants })
 
-        const newParticipantPayloadForLogging = {
-            callId: groupId,
-            participant: {
-                userId: socket.userId,
-                name: socket.user?.name || "Unknown User",
-                profilePicture: socket.user?.profilePicture || "",
-                socketId: socket.id,
-                deviceId: socket.deviceId,
-            },
-        }
-
-        console.log(
-            `[Server Index.js] About to emit 'participant-joined-group' to room ${roomName} for new participant ${socket.userId} (Socket: ${socket.id}). Payload:`,
-            JSON.stringify(newParticipantPayloadForLogging),
-        )
-
-        // Log details about who the event is being sent to
-        const socketsInRoomForBroadcast = await io.in(roomName).fetchSockets() // Re-fetch or use socketsInRoom if still valid and sender is filtered
-        socketsInRoomForBroadcast.forEach((s_in_room) => {
-            if (s_in_room.id !== socket.id) {
-                // Ensure not to log for the sender itself regarding this broadcast
-                console.log(
-                    `[Server Index.js] Emitting 'participant-joined-group' to existing participant ${s_in_room.userId} (Socket: ${s_in_room.id}, Device: ${s_in_room.deviceId}) in room ${roomName}.`,
-                )
-            }
-        })
-
-        // This is the existing emit, ensure its payload is correct
-        socket.to(roomName).emit("participant-joined-group", {
-            callId: groupId,
-            participant: {
-                userId: socket.userId,
-                name: socket.user?.name || "Unknown User",
-                profilePicture: socket.user?.profilePicture || "",
-                socketId: socket.id, // Important for direct WebRTC signaling
-                deviceId: socket.deviceId,
-            },
-        })
         // Notify other participants about the new joiner
         socket.to(roomName).emit("participant-joined-group", {
             callId: groupId,

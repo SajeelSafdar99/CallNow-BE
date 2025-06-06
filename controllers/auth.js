@@ -2,7 +2,7 @@ const User = require("../models/user")
 const OTP = require("../models/otp")
 const { generateOTP, sendOTP } = require("../utils/twilio")
 const { generateToken } = require("../utils/jwt")
-
+const { ensureActiveDeviceConsistency } = require("../utils/devices-helper")
 // 1. Register API
 exports.register = async (req, res) => {
     try {
@@ -214,23 +214,23 @@ exports.resendOTP = async (req, res) => {
 // 4. Login API
 exports.login = async (req, res) => {
     try {
-        const { phoneNumber, password, deviceId, deviceName } = req.body
+        const { phoneNumber, password, deviceId, deviceName } = req.body;
 
         // Validate input
         if (!phoneNumber || !password) {
             return res.status(400).json({
                 success: false,
                 message: "Phone number and password are required",
-            })
+            });
         }
 
         // Find user
-        const user = await User.findOne({ phoneNumber })
+        const user = await User.findOne({ phoneNumber });
         if (!user) {
             return res.status(400).json({
                 success: false,
                 message: "Invalid phone number or password",
-            })
+            });
         }
 
         // Check if user is verified
@@ -239,7 +239,7 @@ exports.login = async (req, res) => {
                 success: false,
                 message: "Account not verified. Please verify your phone number first.",
                 status: "unverified",
-            })
+            });
         }
 
         // Check if user is suspended
@@ -247,13 +247,13 @@ exports.login = async (req, res) => {
             // Check if suspension has expired
             if (user.suspensionDetails?.expiresAt && new Date() > new Date(user.suspensionDetails.expiresAt)) {
                 // Auto-unsuspend if expired
-                user.isSuspended = false
-                user.suspensionDetails = undefined
-                await user.save()
+                user.isSuspended = false;
+                user.suspensionDetails = undefined;
+                await user.save();
             } else {
                 const suspensionMessage = user.suspensionDetails?.reason
                     ? `Account suspended: ${user.suspensionDetails.reason}`
-                    : "Your account has been suspended. Please contact support."
+                    : "Your account has been suspended. Please contact support.";
 
                 return res.status(403).json({
                     success: false,
@@ -261,23 +261,23 @@ exports.login = async (req, res) => {
                     status: "suspended",
                     suspendedAt: user.suspensionDetails?.suspendedAt,
                     expiresAt: user.suspensionDetails?.expiresAt,
-                })
+                });
             }
         }
 
         // Verify password
-        const isPasswordValid = await user.comparePassword(password)
+        const isPasswordValid = await user.comparePassword(password);
         if (!isPasswordValid) {
             return res.status(400).json({
                 success: false,
                 message: "Invalid phone number or password",
-            })
+            });
         }
 
         // Update device information if provided
         if (deviceId && deviceName) {
             // Check if device already exists
-            const deviceExists = user.devices.some((device) => device.deviceId === deviceId)
+            const deviceExists = user.devices.some((device) => device.deviceId === deviceId);
 
             if (!deviceExists) {
                 // Add new device
@@ -285,31 +285,41 @@ exports.login = async (req, res) => {
                     deviceId,
                     deviceName,
                     lastActive: new Date(),
-                })
+                    isActive: false, // Default to not active
+                });
             } else {
                 // Update existing device
                 user.devices = user.devices.map((device) => {
                     if (device.deviceId === deviceId) {
                         return {
-                            ...device,
+                            ...(device.toObject ? device.toObject() : device),
                             deviceName,
                             lastActive: new Date(),
-                        }
+                        };
                     }
-                    return device
-                })
+                    return device;
+                });
             }
 
             // If no active device is set, set this one as active
             if (!user.activeDevice) {
-                user.activeDevice = deviceId
+                user.activeDevice = deviceId;
+
+                // FIX: Update isActive flags to match activeDevice
+                user.devices = user.devices.map(device => ({
+                    ...(device.toObject ? device.toObject() : device),
+                    isActive: device.deviceId === deviceId
+                }));
             }
 
-            await user.save()
+            // FIX: Ensure consistency between activeDevice and isActive flags
+            ensureActiveDeviceConsistency(user);
+
+            await user.save();
         }
 
         // Generate JWT token
-        const token = generateToken(user._id)
+        const token = generateToken(user._id);
 
         res.status(200).json({
             success: true,
@@ -325,16 +335,15 @@ exports.login = async (req, res) => {
                 devices: user.devices,
                 isAdmin: user.isAdmin,
             },
-        })
+        });
     } catch (error) {
-        console.error("Login error:", error)
+        console.error("Login error:", error);
         res.status(500).json({
             success: false,
             message: "Server error during login",
-        })
+        });
     }
-}
-
+};
 // 5. Forget Password API
 exports.forgetPassword = async (req, res) => {
     try {
