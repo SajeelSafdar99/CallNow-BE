@@ -95,7 +95,7 @@ exports.getConversations = async (req, res) => {
                     select: "_id name",
                 },
             })
-            .sort({ updatedAt: -1 }) // Sort by most recent activity
+            .sort({ lastMessageAt: -1, updatedAt: -1 }) // Sort by most recent message
 
         res.status(200).json({
             success: true,

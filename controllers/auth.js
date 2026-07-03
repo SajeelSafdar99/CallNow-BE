@@ -214,7 +214,7 @@ exports.resendOTP = async (req, res) => {
 // 4. Login API
 exports.login = async (req, res) => {
     try {
-        const { phoneNumber, password, deviceId, deviceName } = req.body;
+        const { phoneNumber, password, deviceId, deviceName, platform } = req.body;
 
         // Validate input
         if (!phoneNumber || !password) {
@@ -224,8 +224,8 @@ exports.login = async (req, res) => {
             });
         }
 
-        // Find user
-        const user = await User.findOne({ phoneNumber });
+        // Find user (must explicitly select password since the schema marks it select:false)
+        const user = await User.findOne({ phoneNumber }).select("+password");
         if (!user) {
             return res.status(400).json({
                 success: false,
@@ -284,6 +284,7 @@ exports.login = async (req, res) => {
                 user.devices.push({
                     deviceId,
                     deviceName,
+                    platform: platform || "unknown",
                     lastActive: new Date(),
                     isActive: false, // Default to not active
                 });
@@ -294,6 +295,7 @@ exports.login = async (req, res) => {
                         return {
                             ...(device.toObject ? device.toObject() : device),
                             deviceName,
+                            platform: platform || device.platform || "unknown",
                             lastActive: new Date(),
                         };
                     }
@@ -429,8 +431,8 @@ exports.resetPassword = async (req, res) => {
             })
         }
 
-        // Find user
-        const user = await User.findOne({ phoneNumber })
+        // Find user (need +password so the pre-save hash hook re-hashes correctly)
+        const user = await User.findOne({ phoneNumber }).select("+password")
         if (!user) {
             return res.status(400).json({
                 success: false,
@@ -472,8 +474,8 @@ exports.changePassword = async (req, res) => {
             })
         }
 
-        // Find user
-        const user = await User.findById(userId)
+        // Find user (explicitly select password since schema uses select:false)
+        const user = await User.findById(userId).select("+password")
         if (!user) {
             return res.status(404).json({
                 success: false,

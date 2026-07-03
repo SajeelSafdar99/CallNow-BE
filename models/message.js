@@ -33,6 +33,30 @@ const messageSchema = new mongoose.Schema(
             type: String,
             default: "",
         },
+        mediaDuration: {
+            type: Number, // in seconds (for audio/video)
+            default: 0,
+        },
+        mediaWidth: {
+            type: Number, // for image/video dimensions
+            default: 0,
+        },
+        mediaHeight: {
+            type: Number,
+            default: 0,
+        },
+        status: {
+            type: String,
+            enum: ["sending", "sent", "delivered", "read", "failed"],
+            default: "sent",
+            index: true,
+        },
+        editedAt: {
+            type: Date,
+        },
+        deletedAt: {
+            type: Date,
+        },
         readBy: [
             {
                 user: {
@@ -74,6 +98,13 @@ const messageSchema = new mongoose.Schema(
     },
     { timestamps: true },
 )
+
+// Indexes for efficient sync queries
+messageSchema.index({ conversationId: 1, updatedAt: 1 })
+messageSchema.index({ conversationId: 1, createdAt: -1 })
+messageSchema.index({ sender: 1, createdAt: -1 })
+messageSchema.index({ "readBy.user": 1 })
+messageSchema.index({ "deliveredTo.user": 1 })
 
 const Message = mongoose.model("Message", messageSchema)
 

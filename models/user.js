@@ -12,6 +12,18 @@ const userSchema = new mongoose.Schema(
         password: {
             type: String,
             required: true,
+            select: false, // SEC: don't return password by default; use .select('+password') when needed
+        },
+        email: {
+            type: String,
+            trim: true,
+            lowercase: true,
+            sparse: true, // allow null/missing but unique when present
+            unique: true,
+        },
+        lastSeen: {
+            type: Date,
+            default: Date.now,
         },
         name: {
             type: String,
@@ -54,8 +66,16 @@ const userSchema = new mongoose.Schema(
             {
                 deviceId: String,
                 deviceName: String,
+                platform: String, // e.g. "android", "ios", "web"
                 lastActive: Date,
                 fcmToken: String,
+                fcmTokenUpdatedAt: Date,
+                apnsToken: String,         // For iOS VoIP push (PushKit)
+                apnsTokenUpdatedAt: Date,
+                pushEnabled: {
+                    type: Boolean,
+                    default: true,
+                },
                 isActive: {
                     type: Boolean,
                     default: false,
@@ -99,6 +119,11 @@ userSchema.methods.isSuspensionExpired = function () {
     }
     return new Date() > new Date(this.suspensionDetails.expiresAt)
 }
+
+// Indexes for performance
+userSchema.index({ "devices.deviceId": 1 })
+userSchema.index({ activeDevice: 1 })
+userSchema.index({ isAdmin: 1 })
 
 const User = mongoose.model("User", userSchema)
 

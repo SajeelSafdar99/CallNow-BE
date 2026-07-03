@@ -40,6 +40,11 @@ const callSchema = new mongoose.Schema(
     { timestamps: true },
 )
 
+// Indexes for efficient sync queries
+callSchema.index({ caller: 1, updatedAt: -1 })
+callSchema.index({ receiver: 1, updatedAt: -1 })
+callSchema.index({ startTime: -1 })
+
 const Call = mongoose.model("Call", callSchema)
 
 module.exports = Call

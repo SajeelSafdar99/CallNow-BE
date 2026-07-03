@@ -4,22 +4,39 @@ const mongoose = require("mongoose")
 const cors = require("cors")
 const helmet = require("helmet")
 const morgan = require("morgan")
+const rateLimit = require("express-rate-limit")
+const { LRUCache } = require("lru-cache")
 const connectDB = require("./config/db")
 const app = express()
 const { verifyToken } = require("./utils/jwt")
 const path = require("path")
 const User = require("./models/user")
+const Conversation = require("./models/conversation")
 const socketUtils = require("./utils/socket-utils")
 const { initializeAdminSockets } = require("./utils/admin-socket-functions")
-const { sendCallNotification, sendMessageNotification } = require("./controllers/notification")
+const { sendCallNotificationToUser, sendMessageNotification } = require("./controllers/notification")
 
+// ── Stripe Webhook — MUST be before express.json() so raw body is preserved ──
+const { stripeWebhook } = require("./controllers/subscription")
+app.post("/api/subscriptions/webhook", express.raw({ type: "application/json" }), stripeWebhook)
+
+// Regular body parsing for all other routes
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+
+// ── SEC 1: Restrict CORS by ALLOWED_ORIGINS env var; if unset, allow any (dev fallback) ──
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "").split(",").map((o) => o.trim()).filter(Boolean)
 app.use(
     cors({
-        origin: "*", // Allow all origins
+        origin: (origin, callback) => {
+            // Allow same-origin / non-browser (curl, mobile native) which have no origin
+            if (!origin) return callback(null, true)
+            if (allowedOrigins.length === 0) return callback(null, true) // dev fallback when not configured
+            if (allowedOrigins.includes(origin)) return callback(null, true)
+            return callback(new Error("Not allowed by CORS"))
+        },
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allowedHeaders: "*", // Consider being more specific for production
+        allowedHeaders: ["Content-Type", "Authorization", "x-device-id"],
         credentials: true,
     }),
 )
@@ -30,6 +47,20 @@ app.use(
     }),
 )
 app.use(morgan("dev"))
+
+// ── SEC 2: Rate limiting (stricter on auth routes) ──
+const generalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300, // 300 requests per 15min per IP
+    standardHeaders: true,
+    legacyHeaders: false,
+})
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20, // 20 auth requests per 15min per IP
+    standardHeaders: true,
+    legacyHeaders: false,
+})
 
 connectDB()
 app.use(express.static(path.join(__dirname, "public")))
@@ -49,21 +80,23 @@ const contactRoutes = require("./routes/contact")
 const subscriptionRoutes = require("./routes/subscription")
 const notificationRoutes = require("./routes/notification")
 const adminRoutes = require("./routes/admin")
+const syncRoutes = require("./routes/sync")
 
-app.use("/api/auth", authRoutes)
-app.use("/api/profile", profileRoutes)
-app.use("/api/devices", deviceRoutes)
-app.use("/api/conversations", conversationRoutes)
-app.use("/api/messages", messageRoutes)
-app.use("/api/calls", callRoutes)
-app.use("/api/group-calls", groupCallRoutes)
-app.use("/api/call-logs", callLogRoutes)
-app.use("/api/call-quality", callQualityRoutes)
-app.use("/api/ice-servers", iceServerRoutes)
-app.use("/api/contacts", contactRoutes)
-app.use("/api/subscriptions", subscriptionRoutes)
-app.use("/api/notifications", notificationRoutes)
-app.use("/api/admin", adminRoutes)
+app.use("/api/auth", authLimiter, authRoutes)
+app.use("/api/profile", generalLimiter, profileRoutes)
+app.use("/api/devices", generalLimiter, deviceRoutes)
+app.use("/api/conversations", generalLimiter, conversationRoutes)
+app.use("/api/messages", generalLimiter, messageRoutes)
+app.use("/api/calls", generalLimiter, callRoutes)
+app.use("/api/group-calls", generalLimiter, groupCallRoutes)
+app.use("/api/call-logs", generalLimiter, callLogRoutes)
+app.use("/api/call-quality", generalLimiter, callQualityRoutes)
+app.use("/api/ice-servers", generalLimiter, iceServerRoutes)
+app.use("/api/contacts", generalLimiter, contactRoutes)
+app.use("/api/subscriptions", generalLimiter, subscriptionRoutes)
+app.use("/api/notifications", generalLimiter, notificationRoutes)
+app.use("/api/admin", generalLimiter, adminRoutes)
+app.use("/api/sync", generalLimiter, syncRoutes)
 
 // Test endpoint to check server status
 app.get("/api/test-server-status", (req, res) => {
@@ -82,7 +115,12 @@ const server = app.listen(PORT, () => console.log(`Server running on port ${PORT
 const { Server } = require("socket.io")
 const io = new Server(server, {
     cors: {
-        origin: "*", // Allow all origins
+        origin: (origin, callback) => {
+            if (!origin) return callback(null, true)
+            if (allowedOrigins.length === 0) return callback(null, true)
+            if (allowedOrigins.includes(origin)) return callback(null, true)
+            return callback(new Error("Not allowed by CORS"))
+        },
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowedHeaders: ["Content-Type", "Authorization"],
         credentials: true,
@@ -99,25 +137,28 @@ const userDevices = new Map() // userId (string) -> Set of deviceIds (string)
 const deviceSockets = new Map() // deviceId (string) -> socket.id (string)
 const onlineUsers = new Map() // userId -> { socketId, lastSeen, deviceId, userName }
 
-// Helper function to send push notification for calls
+// PERF 1: LRU cache for socket auth user lookup (30s TTL)
+const socketAuthUserCache = new LRUCache({ max: 1000, ttl: 30000 })
+
+// BUG FIX 8: Helper now calls the dedicated standalone notification function (no more fake req/res)
 const sendCallPushNotification = async (receiverId, callData) => {
     try {
-        const notification = {
+        const notificationPayload = {
             title: `Incoming ${callData.callType} call`,
-            body: `${callData.caller.name} is calling you`,
+            body: `${callData.caller?.name || "Someone"} is calling you`,
             data: {
                 type: "incoming_call",
                 callId: callData.callId,
-                callerId: callData.caller.id,
-                callerName: callData.caller.name,
-                callerProfilePic: callData.caller.profilePicture || "",
+                callerId: callData.caller?.id,
+                callerName: callData.caller?.name,
+                callerProfilePic: callData.caller?.profilePicture || "",
                 callType: callData.callType,
                 timestamp: new Date().toISOString(),
                 isGroupCall: callData.isGroupCall || false,
-                conversationId: callData.conversationId, // For group call context
+                conversationId: callData.conversationId || "",
             },
         }
-        await sendCallNotification(notification) // Assuming this function is defined elsewhere
+        await sendCallNotificationToUser(receiverId, notificationPayload)
     } catch (error) {
         console.error("Error sending call push notification:", error)
     }
@@ -155,7 +196,12 @@ io.use(async (socket, next) => {
     }
 
     try {
-        const user = await User.findById(decoded.id).select("+isSuspended +suspensionDetails") // Ensure these fields are selected
+        // PERF 1: cache user lookup for 30s to reduce DB load on reconnect storms
+        let user = socketAuthUserCache.get(decoded.id)
+        if (!user) {
+            user = await User.findById(decoded.id).select("+isSuspended +suspensionDetails")
+            if (user) socketAuthUserCache.set(decoded.id, user)
+        }
         if (!user) {
             console.warn(`[Socket Auth] Middleware: User ${decoded.id} not found in DB.`)
             return next(new Error("Authentication error: User not found"))
@@ -223,9 +269,22 @@ io.on("connection", (socket) => {
     }
 
     // ===== CONVERSATION EVENTS =====
-    socket.on("join-conversation", (conversationId) => {
-        socket.join(conversationId)
-        console.log(`User ${socket.userId} (Device: ${socket.deviceId}) joined conversation: ${conversationId}`)
+    // SEC 4: verify user is a participant before joining the conversation room
+    socket.on("join-conversation", async (conversationId) => {
+        try {
+            if (!conversationId) return
+            const conv = await Conversation.findOne({ _id: conversationId, participants: socket.userId }).select("_id")
+            if (!conv) {
+                console.warn(`[Socket] join-conversation DENIED: user ${socket.userId} is not a participant of ${conversationId}`)
+                socket.emit("error", { event: "join-conversation", message: "Unauthorized to join this conversation" })
+                return
+            }
+            socket.join(conversationId)
+            console.log(`User ${socket.userId} (Device: ${socket.deviceId}) joined conversation: ${conversationId}`)
+        } catch (e) {
+            console.error("[Socket] join-conversation error:", e)
+            socket.emit("error", { event: "join-conversation", message: "Server error" })
+        }
     })
 
     socket.on("leave-conversation", (conversationId) => {
@@ -275,20 +334,44 @@ io.on("connection", (socket) => {
         }
     })
 
-    socket.on("mark-as-read", (messageId) => {
-        socket.broadcast.emit("message-read", {
-            messageId,
-            userId: socket.userId,
-            deviceId: socket.deviceId,
-        })
+    socket.on("mark-as-read", (payload) => {
+        // payload = { messageId, conversationId, userId }
+        const { messageId, conversationId } = payload || {}
+        if (conversationId) {
+            // Notify only participants in this conversation (not the sender)
+            socket.to(conversationId).emit("message-read", {
+                messageId,
+                conversationId,
+                userId: socket.userId,
+                deviceId: socket.deviceId,
+            })
+        } else {
+            // Fallback: broadcast (legacy clients that only send messageId string)
+            socket.broadcast.emit("message-read", {
+                messageId,
+                userId: socket.userId,
+                deviceId: socket.deviceId,
+            })
+        }
     })
 
-    socket.on("mark-as-delivered", (messageId) => {
-        socket.broadcast.emit("message-delivered", {
-            messageId,
-            userId: socket.userId,
-            deviceId: socket.deviceId,
-        })
+    socket.on("mark-as-delivered", (payload) => {
+        // payload = { messageId, conversationId, userId }
+        const { messageId, conversationId } = payload || {}
+        if (conversationId) {
+            socket.to(conversationId).emit("message-delivered", {
+                messageId,
+                conversationId,
+                userId: socket.userId,
+                deviceId: socket.deviceId,
+            })
+        } else {
+            socket.broadcast.emit("message-delivered", {
+                messageId,
+                userId: socket.userId,
+                deviceId: socket.deviceId,
+            })
+        }
     })
 
     // ===== TYPING EVENTS =====
@@ -505,6 +588,23 @@ io.on("connection", (socket) => {
                 console.error(`[Accept Call] Error emitting 'call-accepted' to caller socket ${callerSocketInstance.id}:`, e)
             }
         })
+
+        // Notify OTHER devices of the callee that the call was answered here
+        // so they stop ringing
+        if (userDevices.has(socket.userId)) {
+            userDevices.get(socket.userId).forEach((devId) => {
+                if (devId !== accepterDeviceId) {
+                    const targetSocketId = deviceSockets.get(devId)
+                    if (targetSocketId) {
+                        io.to(targetSocketId).emit("call-answered-on-other-device", {
+                            callId,
+                            answeredOnDeviceId: accepterDeviceId,
+                        })
+                        console.log(`[Accept Call] Notified callee device ${devId} that call ${callId} was answered on device ${accepterDeviceId}`)
+                    }
+                }
+            })
+        }
     })
 
     socket.on("reject-call", async ({ callId, callerId, reason, rejecterDeviceId }) => {
@@ -536,6 +636,12 @@ io.on("connection", (socket) => {
                 if (devId !== actualRejecterDeviceId) {
                     const targetSocketId = deviceSockets.get(devId)
                     if (targetSocketId) {
+                        // Emit both the specific event the frontend listens to AND
+                        // the generic termination event
+                        io.to(targetSocketId).emit("call-rejected-on-other-device", {
+                            callId,
+                            rejectedOnDeviceId: actualRejecterDeviceId,
+                        })
                         io.to(targetSocketId).emit("call-session-terminated", {
                             callId,
                             reason: "rejected_by_own_device",
@@ -808,45 +914,8 @@ io.on("connection", (socket) => {
         })
     })
 
-    // The existing "group-ice-candidate", "group-offer", "group-answer" with "toParticipant"
-    // might be intended for a different flow or if "toParticipant" is a socket ID.
-    // For clarity, I've added "*-to-peer" events. If the original ones are preferred,
-    // ensure "toParticipant" is consistently a socket ID.
-    // For now, I'll keep the original ones as they were, assuming client handles `toParticipant` as socket ID.
-    socket.on("group-ice-candidate", ({ callId, candidate, fromParticipant, toParticipant }) => {
-        // Assuming toParticipant is a socket ID
-        console.log(
-            `Legacy group-ice-candidate: from ${fromParticipant}(${socket.userId}) to ${toParticipant} for call ${callId}`,
-        )
-        io.to(toParticipant).emit("group-ice-candidate", {
-            callId,
-            candidate,
-            fromParticipant: socket.userId, // or fromParticipant if it's already userId
-            fromSocketId: socket.id,
-        })
-    })
-
-    socket.on("group-offer", ({ callId, fromParticipant, toParticipant, offer }) => {
-        // Assuming toParticipant is a socket ID
-        console.log(`Legacy group-offer: from ${fromParticipant}(${socket.userId}) to ${toParticipant} for call ${callId}`)
-        io.to(toParticipant).emit("group-offer", {
-            callId,
-            fromParticipant: socket.userId, // or fromParticipant if it's already userId
-            fromSocketId: socket.id,
-            offer,
-        })
-    })
-
-    socket.on("group-answer", ({ callId, fromParticipant, toParticipant, answer }) => {
-        // Assuming toParticipant is a socket ID
-        console.log(`Legacy group-answer: from ${fromParticipant}(${socket.userId}) to ${toParticipant} for call ${callId}`)
-        io.to(toParticipant).emit("group-answer", {
-            callId,
-            fromParticipant: socket.userId, // or fromParticipant if it's already userId
-            fromSocketId: socket.id,
-            answer,
-        })
-    })
+    // SOCK 1: Legacy group-call relay handlers removed. Use the *-to-peer variants
+    // (group-offer-to-peer / group-answer-to-peer / group-ice-candidate-to-peer) defined above.
 
     socket.on("participant-muted", ({ callId, participantId, isMuted }) => {
         io.to(`group-call:${callId}`).emit("group-participant-muted", {
@@ -1027,7 +1096,45 @@ io.on("connection", (socket) => {
         }
     })
 
+    // BUG FIX 2: Forward the ICE restart answer back to the original requester (1-to-1)
+    socket.on("answer-ice-restart", ({ callId, recipientId, answer }) => {
+        if (!recipientId || !answer) return
+        if (userDevices.has(recipientId)) {
+            userDevices.get(recipientId).forEach((devId) => {
+                const targetSocketId = deviceSockets.get(devId)
+                if (targetSocketId) {
+                    io.to(targetSocketId).emit("ice-restart-answer", {
+                        callId,
+                        answer,
+                        fromUserId: socket.userId,
+                        fromDeviceId: socket.deviceId,
+                    })
+                }
+            })
+        }
+    })
+
     // ===== NOTIFICATION EVENTS =====
+    socket.on("call-answered-on-device", ({ callId, deviceId, isGroupCall }) => {
+        // A device of this user answered the call — tell all OTHER devices of the same user to stop ringing
+        const answeredDeviceId = deviceId || socket.deviceId
+        console.log(`[Call Answered On Device] User ${socket.userId} answered call ${callId} on device ${answeredDeviceId}`)
+        if (userDevices.has(socket.userId)) {
+            userDevices.get(socket.userId).forEach((devId) => {
+                if (devId !== answeredDeviceId) {
+                    const targetSocketId = deviceSockets.get(devId)
+                    if (targetSocketId) {
+                        io.to(targetSocketId).emit("call-answered-on-other-device", {
+                            callId,
+                            answeredOnDeviceId: answeredDeviceId,
+                            isGroupCall: isGroupCall || false,
+                        })
+                    }
+                }
+            })
+        }
+    })
+
     socket.on("send-call-push-notification", async ({ receiverId, callData }) => {
         await sendCallPushNotification(receiverId, callData)
     })
@@ -1043,16 +1150,17 @@ io.on("connection", (socket) => {
     })
 
     // ===== DEVICE MANAGEMENT =====
-    socket.on("participant-device-change", ({ participantId, newActiveDevice }) => {
+    // SEC 6: only allow broadcasting a device change for the authenticated user themselves.
+    socket.on("participant-device-change", ({ newActiveDevice }) => {
         socket.broadcast.emit("participant-device-change", {
-            participantId,
+            participantId: socket.userId,
             newActiveDevice,
         })
     })
 
-    socket.on("participant-status-update", ({ participantId, status }) => {
+    socket.on("participant-status-update", ({ status }) => {
         socket.broadcast.emit("participant-status-update", {
-            participantId,
+            participantId: socket.userId,
             status,
         })
     })

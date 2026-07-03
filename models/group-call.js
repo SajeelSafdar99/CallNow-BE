@@ -64,9 +64,21 @@ const groupCallSchema = new mongoose.Schema(
             type: Number,
             default: 8, // Default limit for group calls
         },
+        peakParticipantCount: {
+            type: Number,
+            default: 0,
+        },
+        callQualityAverage: {
+            type: Number,
+            default: 0,
+        },
     },
     { timestamps: true },
 )
+
+// Indexes for efficient sync queries
+groupCallSchema.index({ "participants.user": 1, updatedAt: -1 })
+groupCallSchema.index({ startTime: -1 })
 
 const GroupCall = mongoose.model("GroupCall", groupCallSchema)
 

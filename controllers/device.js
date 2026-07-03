@@ -184,7 +184,8 @@ exports.removeDevice = async (req, res) => {
 exports.logoutAllOtherDevices = async (req, res) => {
     try {
         const userId = req.userId; // From auth middleware
-        const { currentDeviceId } = req.params;
+        // currentDeviceId is sent in request body (POST route, no URL param)
+        const { currentDeviceId } = req.body;
 
         if (!currentDeviceId) {
             return res.status(400).json({

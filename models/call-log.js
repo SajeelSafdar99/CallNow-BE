@@ -37,6 +37,7 @@ const callLogSchema = new mongoose.Schema(
 callLogSchema.index({ callId: 1, timestamp: 1 })
 callLogSchema.index({ user: 1, timestamp: -1 })
 callLogSchema.index({ callType: 1, eventType: 1, timestamp: -1 })
+callLogSchema.index({ user: 1, updatedAt: -1 }) // for sync delta queries
 
 const CallLog = mongoose.model("CallLog", callLogSchema)
 

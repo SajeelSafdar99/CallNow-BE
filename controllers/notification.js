@@ -402,9 +402,100 @@ const updateFCMToken = async (req, res) => {
     }
 }
 
+// BUG FIX (Part 1, Bug 8): Standalone helper that can be called directly from
+// internal server code (e.g. socket handlers) without faking req/res objects.
+// Accepts (receiverId, notificationPayload) where notificationPayload is:
+//   { title, body, data: { ... } }
+const sendCallNotificationToUser = async (receiverId, notificationPayload) => {
+    try {
+        if (!receiverId || !notificationPayload) {
+            console.warn("sendCallNotificationToUser: missing receiverId or notificationPayload")
+            return { success: false, message: "Missing receiverId or notificationPayload" }
+        }
+
+        const user = await User.findById(receiverId).select("devices name")
+        if (!user) {
+            console.warn(`sendCallNotificationToUser: user ${receiverId} not found`)
+            return { success: false, message: "User not found" }
+        }
+
+        const activeTokens = (user.devices || [])
+            .filter((d) => d && d.fcmToken && d.fcmToken.trim() !== "" && d.isActive && d.pushEnabled !== false)
+            .map((d) => d.fcmToken)
+
+        if (activeTokens.length === 0) {
+            console.log(`sendCallNotificationToUser: no active push tokens for user ${receiverId}`)
+            return { success: false, message: "No active devices" }
+        }
+
+        const dataPayload = Object.keys(notificationPayload.data || {}).reduce((acc, key) => {
+            const val = notificationPayload.data[key]
+            // FCM requires all data values to be strings
+            acc[key] = typeof val === "string" ? val : JSON.stringify(val)
+            return acc
+        }, {})
+
+        const fcmMessage = {
+            notification: {
+                title: notificationPayload.title,
+                body: notificationPayload.body,
+            },
+            data: dataPayload,
+            android: {
+                priority: "high",
+                notification: {
+                    channelId: dataPayload.type === "incoming_call" ? "calls" : "messages",
+                    priority: "max",
+                    defaultSound: true,
+                    defaultVibrateTimings: true,
+                },
+            },
+            apns: {
+                payload: {
+                    aps: {
+                        sound: "default",
+                        badge: 1,
+                        category: dataPayload.type === "incoming_call" ? "CALL_INVITE" : "MESSAGE",
+                        "content-available": 1,
+                    },
+                },
+                headers: {
+                    "apns-priority": "10",
+                    "apns-push-type": dataPayload.type === "incoming_call" ? "voip" : "alert",
+                },
+            },
+            tokens: activeTokens,
+        }
+
+        const response = await admin.messaging().sendEachForMulticast(fcmMessage)
+        console.log(
+            `sendCallNotificationToUser: sent to user ${receiverId}. Success: ${response.successCount}, Failed: ${response.failureCount}`,
+        )
+
+        if (response.failureCount > 0) {
+            const failedTokens = []
+            response.responses.forEach((resp, idx) => {
+                if (!resp.success) failedTokens.push(activeTokens[idx])
+            })
+            if (failedTokens.length > 0) {
+                await User.updateOne(
+                    { _id: receiverId },
+                    { $pull: { "devices.$[].fcmToken": { $in: failedTokens } } },
+                )
+            }
+        }
+
+        return { success: true, successCount: response.successCount, failureCount: response.failureCount }
+    } catch (error) {
+        console.error("sendCallNotificationToUser error:", error)
+        return { success: false, message: error.message }
+    }
+}
+
 module.exports = {
     sendPushNotificationToUser,
     sendCallNotification,
+    sendCallNotificationToUser,
     updateFCMToken,
     sendMessageNotification,
 }

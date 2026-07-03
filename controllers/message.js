@@ -3,13 +3,23 @@ const Conversation = require("../models/conversation")
 const mongoose = require("mongoose")
 const path = require("path")
 const upload = require("../middleware/upload")
-const { sendMessageNotification } = require("../controllers/notification");
+const { sendMessageNotification } = require("../controllers/notification")
+const { getSocketInstance } = require("../utils/socket-utils")
 
 // Send message
 exports.sendMessage = async (req, res) => {
     try {
         const userId = req.userId // From auth middleware
-        const { conversationId, content, contentType = "text", replyTo } = req.body
+        const {
+            conversationId,
+            content,
+            contentType = "text",
+            replyTo,
+            // Optional client-provided media metadata
+            mediaDuration,
+            mediaWidth,
+            mediaHeight,
+        } = req.body
 
         // Validate input
         if (!conversationId || (!content && !req.file && !req.files)) {
@@ -47,6 +57,7 @@ exports.sendMessage = async (req, res) => {
             sender: userId,
             content: content || "",
             contentType: contentType,
+            status: "sent",
         }
 
         // Add reply reference if provided
@@ -88,6 +99,10 @@ exports.sendMessage = async (req, res) => {
                     mediaUrl: relativePath,
                     mediaSize: file.size,
                     mediaName: file.originalname,
+                    // Propagate optional metadata coming from the client
+                    ...(mediaDuration ? { mediaDuration: Number(mediaDuration) || 0 } : {}),
+                    ...(mediaWidth ? { mediaWidth: Number(mediaWidth) || 0 } : {}),
+                    ...(mediaHeight ? { mediaHeight: Number(mediaHeight) || 0 } : {}),
                 };
 
                 // Set content based on file type if not provided
@@ -130,8 +145,9 @@ exports.sendMessage = async (req, res) => {
                 messages.push(newMessage);
             }
 
-            // Update conversation with last message
+            // Update conversation with last message + timestamp (for chat list ordering)
             conversation.lastMessage = messages[messages.length - 1]._id;
+            conversation.lastMessageAt = messages[messages.length - 1].createdAt;
 
             // Update unread counts for all participants except sender
             conversation.unreadCounts.forEach((uc) => {
@@ -176,6 +192,10 @@ exports.sendMessage = async (req, res) => {
             messageData.mediaUrl = relativePath
             messageData.mediaSize = req.file.size
             messageData.mediaName = req.file.originalname
+            // Propagate optional metadata coming from the client
+            if (mediaDuration) messageData.mediaDuration = Number(mediaDuration) || 0
+            if (mediaWidth) messageData.mediaWidth = Number(mediaWidth) || 0
+            if (mediaHeight) messageData.mediaHeight = Number(mediaHeight) || 0
 
             // Set default content if not provided
             if (!content) {
@@ -195,8 +215,9 @@ exports.sendMessage = async (req, res) => {
         const newMessage = new Message(messageData)
         await newMessage.save()
 
-        // Update conversation with last message
+        // Update conversation with last message + timestamp (for chat list ordering)
         conversation.lastMessage = newMessage._id
+        conversation.lastMessageAt = newMessage.createdAt
 
         // Update unread counts for all participants except sender
         conversation.unreadCounts.forEach((uc) => {
@@ -294,6 +315,7 @@ exports.getMessages = async (req, res) => {
                         readAt: new Date(),
                     },
                 },
+                $set: { status: "read" }, // top-level convenience field
             },
         )
 
@@ -364,6 +386,18 @@ exports.deleteMessage = async (req, res) => {
                 await conversation.save()
             }
 
+            // Emit real-time socket event so all participants see it removed instantly
+            try {
+                const io = getSocketInstance()
+                io.to(message.conversationId.toString()).emit("message-deleted", {
+                    messageId,
+                    conversationId: message.conversationId.toString(),
+                    deletedBy: userId,
+                })
+            } catch (socketErr) {
+                console.error("Socket emit error for message-deleted:", socketErr)
+            }
+
             return res.status(200).json({
                 success: true,
                 message: "Message deleted for everyone",
@@ -428,6 +462,7 @@ exports.markAsDelivered = async (req, res) => {
                         deliveredAt: new Date(),
                     },
                 },
+                $set: { status: "delivered" }, // top-level convenience field
             },
         )
 

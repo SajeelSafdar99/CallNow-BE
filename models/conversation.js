@@ -33,6 +33,11 @@ const conversationSchema = new mongoose.Schema(
             type: mongoose.Schema.Types.ObjectId,
             ref: "Message",
         },
+        lastMessageAt: {
+            type: Date,
+            default: Date.now,
+            index: true,
+        },
         unreadCounts: [
             {
                 user: {
@@ -48,6 +53,10 @@ const conversationSchema = new mongoose.Schema(
     },
     { timestamps: true },
 )
+
+// Index for efficient sync queries
+conversationSchema.index({ participants: 1, updatedAt: -1 })
+conversationSchema.index({ participants: 1, lastMessageAt: -1 })
 
 const Conversation = mongoose.models.Conversation || mongoose.model("Conversation", conversationSchema)
 
